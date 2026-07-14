@@ -53,3 +53,17 @@ func TestLoad_BadBase64Secret(t *testing.T) {
 	_, err := Load()
 	require.ErrorContains(t, err, "POW_SECRET")
 }
+
+func TestLoad_ShortSecret(t *testing.T) {
+	setRequired(t)
+	t.Setenv("POW_SECRET", base64.StdEncoding.EncodeToString(make([]byte, 16)))
+	_, err := Load()
+	require.ErrorContains(t, err, "POW_SECRET")
+}
+
+func TestLoad_ShortSecretPrev(t *testing.T) {
+	setRequired(t)
+	t.Setenv("POW_SECRET_PREV", base64.StdEncoding.EncodeToString(make([]byte, 16)))
+	_, err := Load()
+	require.ErrorContains(t, err, "POW_SECRET_PREV")
+}

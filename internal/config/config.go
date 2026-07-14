@@ -41,11 +41,17 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("POW_SECRET: %w", err)
 	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("POW_SECRET must decode to 32 bytes, got %d", len(key))
+	}
 	c.PowSecret = key
 	if prev := os.Getenv("POW_SECRET_PREV"); prev != "" {
 		k, err := base64.StdEncoding.DecodeString(prev)
 		if err != nil {
 			return nil, fmt.Errorf("POW_SECRET_PREV: %w", err)
+		}
+		if len(k) != 32 {
+			return nil, fmt.Errorf("POW_SECRET_PREV must decode to 32 bytes, got %d", len(k))
 		}
 		c.PowSecretPrev = k
 	}
