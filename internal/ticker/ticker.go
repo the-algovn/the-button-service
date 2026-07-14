@@ -202,6 +202,10 @@ func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
 			t.Logger.Warn("leader total read failed", "err", err)
 			continue
 		}
+		// Freshness signal for the frozen-counter alert: set on every
+		// successful tick, not gated on total changing, so an idle counter
+		// (no click traffic) is never mistaken for a stuck tick loop.
+		lastTickUnixtime.Set(float64(time.Now().Unix()))
 		if int64(total) != lastPublished {
 			t.publishJSON(counterChannel, map[string]any{"type": "counter", "total": total})
 			t.claimMilestones(ctx, total)
