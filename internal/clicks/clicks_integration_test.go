@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -36,10 +37,13 @@ func setup(t *testing.T) (*redis.Client, *pgxpool.Pool) {
 	return rdb, pool
 }
 
-func payload(id, sub string, minInterval uint32) pow.Payload {
+// payload's ID must be a valid uuid (the outbox table's primary key column
+// is uuid — spec §7), so it is generated here rather than taken as a
+// caller-supplied label.
+func payload(sub string, minInterval uint32) pow.Payload {
 	now := time.Now()
 	return pow.Payload{
-		ID: id, Sub: sub, Iat: now.Unix(), Exp: now.Add(pow.TokenTTL).Unix(),
+		ID: uuid.New().String(), Sub: sub, Iat: now.Unix(), Exp: now.Add(pow.TokenTTL).Unix(),
 		W0: 16384, L: 1, MinIntervalS: minInterval, MaxBatch: pow.MaxBatch,
 	}
 }
@@ -55,7 +59,7 @@ func unlockedIDs(res *Result) []string {
 func TestSubmit_HappyPathAndReplay(t *testing.T) {
 	rdb, pool := setup(t)
 	ctx := context.Background()
-	p := payload("tok-1", "user-1", 1)
+	p := payload("user-1", 1)
 
 	res, err := Submit(ctx, rdb, pool, logger, p, 5, time.Now())
 	require.NoError(t, err)
@@ -71,18 +75,40 @@ func TestSubmit_HappyPathAndReplay(t *testing.T) {
 	require.Equal(t, codes.AlreadyExists, status.Code(err))
 }
 
+// TestSubmit_AppliesCounterAndClearsOutbox proves the happy path of the
+// transactional outbox (spec §6): after a successful Submit, counter:global
+// equals the batch's clicks, the idempotency marker applied:<id> exists, and
+// the outbox row inserted alongside the user_clicks upsert is gone.
+func TestSubmit_AppliesCounterAndClearsOutbox(t *testing.T) {
+	rdb, pool := setup(t)
+	ctx := context.Background()
+	p := payload("user-outbox", 1)
+
+	res, err := Submit(ctx, rdb, pool, logger, p, 7, time.Now())
+	require.NoError(t, err)
+	require.EqualValues(t, 7, res.UserTotal)
+
+	require.Equal(t, "7", rdb.Get(ctx, "counter:global").Val())
+	require.Equal(t, int64(1), rdb.Exists(ctx, "applied:"+p.ID).Val())
+
+	var remaining int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM counter_outbox WHERE id = $1`, p.ID).Scan(&remaining))
+	require.Zero(t, remaining, "outbox row must be deleted after a successful apply")
+}
+
 func TestSubmit_ThrottleUnburnsToken(t *testing.T) {
 	rdb, pool := setup(t)
 	ctx := context.Background()
 
-	_, err := Submit(ctx, rdb, pool, logger, payload("tok-a", "user-2", 1), 1, time.Now())
+	_, err := Submit(ctx, rdb, pool, logger, payload("user-2", 1), 1, time.Now())
 	require.NoError(t, err)
 
 	// immediately again with a fresh token: throttled AND un-burned
-	p2 := payload("tok-b", "user-2", 1)
+	p2 := payload("user-2", 1)
 	_, err = Submit(ctx, rdb, pool, logger, p2, 1, time.Now())
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
-	require.Equal(t, int64(0), rdb.Exists(ctx, "pow:tok-b").Val())
+	require.Equal(t, int64(0), rdb.Exists(ctx, "pow:"+p2.ID).Val())
 
 	// after the interval the SAME token succeeds — client did not re-solve
 	time.Sleep(1200 * time.Millisecond)
@@ -99,11 +125,11 @@ func TestSubmit_TxnFailureCompensates(t *testing.T) {
 	_, err := pool.Exec(ctx, `ALTER TABLE user_clicks RENAME TO user_clicks_broken`)
 	require.NoError(t, err)
 
-	p := payload("tok-c", "user-3", 1)
+	p := payload("user-3", 1)
 	_, err = Submit(ctx, rdb, pool, logger, p, 3, time.Now())
 	require.Equal(t, codes.Unavailable, status.Code(err))
 	// compensation removed both keys — the token is spendable again
-	require.Equal(t, int64(0), rdb.Exists(ctx, "pow:tok-c", "throttle:user-3").Val())
+	require.Equal(t, int64(0), rdb.Exists(ctx, "pow:"+p.ID, "throttle:user-3").Val())
 	// and no counter bump happened for the failed attempt
 	require.Equal(t, int64(0), rdb.Exists(ctx, "counter:global").Val())
 
@@ -122,7 +148,7 @@ func TestSubmit_Crosses69(t *testing.T) {
 	_, err := pool.Exec(ctx, `INSERT INTO user_clicks (user_sub, clicks) VALUES ('user-4', 60)`)
 	require.NoError(t, err)
 
-	res, err := Submit(ctx, rdb, pool, logger, payload("tok-d", "user-4", 1), 10, time.Now())
+	res, err := Submit(ctx, rdb, pool, logger, payload("user-4", 1), 10, time.Now())
 	require.NoError(t, err)
 	require.EqualValues(t, 70, res.UserTotal)
 	got := unlockedIDs(res)
@@ -134,7 +160,7 @@ func TestSubmit_BatchAchievementsOnceOnly(t *testing.T) {
 	rdb, pool := setup(t)
 	ctx := context.Background()
 
-	res, err := Submit(ctx, rdb, pool, logger, payload("tok-e", "user-5", 1), 10_000, time.Now())
+	res, err := Submit(ctx, rdb, pool, logger, payload("user-5", 1), 10_000, time.Now())
 	require.NoError(t, err)
 	got := unlockedIDs(res)
 	for _, want := range []string{"mvh", "ten", "nice", "century", "blaze", "comma", "carpal", "bigbatch", "maxbatch"} {
@@ -146,7 +172,7 @@ func TestSubmit_BatchAchievementsOnceOnly(t *testing.T) {
 
 	// second max batch: bigbatch/maxbatch rows already exist → not re-unlocked
 	time.Sleep(1200 * time.Millisecond) // clear throttle
-	res2, err := Submit(ctx, rdb, pool, logger, payload("tok-f", "user-5", 1), 10_000, time.Now())
+	res2, err := Submit(ctx, rdb, pool, logger, payload("user-5", 1), 10_000, time.Now())
 	require.NoError(t, err)
 	require.EqualValues(t, 20_000, res2.UserTotal)
 	for _, u := range res2.Unlocked {
@@ -197,7 +223,7 @@ func TestApplyBatch_CommitErrorWrappedAmbiguous(t *testing.T) {
 
 	dctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancel()
-	_, err := applyBatch(dctx, pool, "user-ambig-direct", 1, time.Now())
+	_, err := applyBatch(dctx, pool, uuid.New().String(), "user-ambig-direct", 1, time.Now())
 	require.Error(t, err)
 	require.ErrorIs(t, err, errCommitAmbiguous)
 }
@@ -215,7 +241,7 @@ func TestSubmit_AmbiguousCommitKeepsBurn(t *testing.T) {
 	release := holdCommitBlockLock(t, ctx, pool)
 	defer release()
 
-	p := payload("tok-ambig", "user-ambig", 1)
+	p := payload("user-ambig", 1)
 	sctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancel()
 	_, err := Submit(sctx, rdb, pool, logger, p, 1, time.Now())
@@ -223,7 +249,7 @@ func TestSubmit_AmbiguousCommitKeepsBurn(t *testing.T) {
 
 	// Both keys MUST still be present (fail-closed) — a retry of this token
 	// must be rejected as a replay rather than credited again.
-	exists, rerr := rdb.Exists(context.Background(), "pow:tok-ambig", "throttle:user-ambig").Result()
+	exists, rerr := rdb.Exists(context.Background(), "pow:"+p.ID, "throttle:user-ambig").Result()
 	require.NoError(t, rerr)
 	require.EqualValues(t, 2, exists, "ambiguous commit must keep the PoW burn and throttle key")
 }
@@ -234,7 +260,7 @@ func TestSubmit_AmbiguousCommitKeepsBurn(t *testing.T) {
 func TestSubmit_ConcurrentReplayExactlyOneWinner(t *testing.T) {
 	rdb, pool := setup(t)
 	ctx := context.Background()
-	p := payload("tok-race", "user-race", 1)
+	p := payload("user-race", 1)
 
 	const n = 8
 	codesCh := make(chan codes.Code, n)

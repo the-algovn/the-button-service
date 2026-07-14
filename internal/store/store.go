@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS user_achievements (
   user_sub text NOT NULL, achievement_id text NOT NULL,
   unlocked_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_sub, achievement_id));
+CREATE TABLE IF NOT EXISTS counter_outbox (
+  id         uuid PRIMARY KEY,
+  clicks     bigint NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS counter_outbox_created_at_idx ON counter_outbox (created_at);
 `
 
 // NewPG opens a pgx pool (MaxConns 10, statement_timeout 2s — spec §7) and
@@ -62,6 +68,37 @@ func applySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// ApplyCounterScript idempotently applies a batch's clicks to counter:global,
+// keyed by the batch's outbox id (its PoW challenge id, spec §6/§8). A diff
+// between Postgres and Redis can never tell a lost increment from one merely
+// in flight, so the counter is no longer healed by diffing: this script is
+// safe to run any number of times for the same id — from the write path
+// right after commit, or later from the outbox sweeper — because the
+// "applied:<id>" marker only ever transitions once.
+const ApplyCounterScript = `
+if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
+  return redis.call('INCRBY', KEYS[2], ARGV[1])
+end
+return redis.call('GET', KEYS[2])
+`
+
+// appliedMarkerTTLSeconds bounds the "applied:<id>" marker: long enough that
+// the sweeper, which only looks at rows outside the in-flight window, can
+// never re-apply an already-applied batch.
+const appliedMarkerTTLSeconds = 86400 // 24h
+
+// Scripter is the subset of the Redis client ApplyCounter needs.
+type Scripter interface {
+	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
+}
+
+// ApplyCounter runs ApplyCounterScript for outbox row id against
+// counter:global.
+func ApplyCounter(ctx context.Context, rdb Scripter, id string, clicks int64) error {
+	return rdb.Eval(ctx, ApplyCounterScript,
+		[]string{"applied:" + id, "counter:global"}, clicks, appliedMarkerTTLSeconds).Err()
 }
 
 // NewRedis parses REDIS_URL and verifies connectivity with a PING.

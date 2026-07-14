@@ -17,14 +17,15 @@ import (
 
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/pow"
+	"github.com/the-algovn/the-button-service/internal/store"
 )
 
 // Rediser is the slice of go-redis used by Submit (satisfied by *redis.Client).
 type Rediser interface {
 	SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.BoolCmd
 	Del(ctx context.Context, keys ...string) *redis.IntCmd
-	IncrBy(ctx context.Context, key string, value int64) *redis.IntCmd
 	Incr(ctx context.Context, key string) *redis.IntCmd
+	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
 }
 
 // Unlock is a newly earned achievement with its database timestamp.
@@ -76,7 +77,7 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 	}
 
 	// Step 3: durable personal truth.
-	res, err := applyBatch(ctx, pool, p.Sub, count, now)
+	res, err := applyBatch(ctx, pool, p.ID, p.Sub, count, now)
 	if err != nil {
 		logger.Warn("batch txn failed", "sub", p.Sub, "err", err)
 		// Pre-commit failures rolled back cleanly — release the burn and the
@@ -94,9 +95,18 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 		return nil, status.Error(codes.Unavailable, "postgres unavailable")
 	}
 
-	// Step 4: hot counter + controller signal — drift healed by reconcile.
-	if err := rdb.IncrBy(bg, "counter:global", int64(count)).Err(); err != nil {
-		logger.Warn("counter INCRBY failed", "err", err)
+	// Step 4: idempotent counter apply + controller signal. The outbox row
+	// inserted inside the txn above lets the sweeper (internal/ticker) apply
+	// this batch later if the process crashes or Redis blips before this
+	// call — a diff between Postgres and Redis can never distinguish a lost
+	// apply from one merely in flight, so the counter is no longer healed by
+	// diffing (spec §6/§8).
+	if err := store.ApplyCounter(bg, rdb, p.ID, int64(count)); err != nil {
+		logger.Warn("counter apply failed", "err", err)
+	} else if _, err := pool.Exec(bg, `DELETE FROM counter_outbox WHERE id = $1`, p.ID); err != nil {
+		// best-effort: if this fails the sweeper will re-apply idempotently
+		// (a no-op, since applied:<id> is already set) and delete later
+		logger.Warn("outbox delete failed", "id", p.ID, "err", err)
 	}
 	if err := rdb.Incr(bg, "stats:accepted_total").Err(); err != nil {
 		logger.Warn("stats INCR failed", "err", err)
@@ -110,7 +120,7 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 // clicks twice, and there is no batch-level idempotency key to catch it.
 var errCommitAmbiguous = errors.New("commit outcome ambiguous")
 
-func applyBatch(ctx context.Context, pool *pgxpool.Pool, sub string, count uint32, now time.Time) (*Result, error) {
+func applyBatch(ctx context.Context, pool *pgxpool.Pool, id, sub string, count uint32, now time.Time) (*Result, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -123,6 +133,14 @@ func applyBatch(ctx context.Context, pool *pgxpool.Pool, sub string, count uint3
 		 ON CONFLICT (user_sub) DO UPDATE SET clicks = u.clicks + $2
 		 RETURNING clicks`, sub, int64(count)).Scan(&total)
 	if err != nil {
+		return nil, err
+	}
+
+	// Outbox row in the SAME txn as the upsert: an ambiguous-but-landed
+	// commit (below) leaves this row for the sweeper to apply, closing the
+	// under-count that an ambiguous commit would otherwise leave.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO counter_outbox (id, clicks) VALUES ($1, $2)`, id, int64(count)); err != nil {
 		return nil, err
 	}
 
