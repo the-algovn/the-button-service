@@ -5,6 +5,7 @@ package clicks
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -78,9 +79,16 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 	res, err := applyBatch(ctx, pool, p.Sub, count, now)
 	if err != nil {
 		logger.Warn("batch txn failed", "sub", p.Sub, "err", err)
-		// best-effort compensation; if this DEL fails the client re-solves
-		// one challenge — accepted (spec §13)
-		if derr := rdb.Del(bg, powKey, throttleKey).Err(); derr != nil {
+		// Pre-commit failures rolled back cleanly — release the burn and the
+		// throttle so the client can retry the same token immediately.
+		// An ambiguous commit may have landed: keep the burn (the token is
+		// spent) so a retry cannot double-credit the batch. The client
+		// re-issues a challenge; at worst one PoW solve is wasted.
+		if errors.Is(err, errCommitAmbiguous) {
+			logger.Warn("commit ambiguous; keeping PoW burn to prevent double-credit", "sub", p.Sub)
+		} else if derr := rdb.Del(bg, powKey, throttleKey).Err(); derr != nil {
+			// best-effort compensation; if this DEL fails the client re-solves
+			// one challenge — accepted (spec §13)
 			logger.Warn("compensation DEL failed", "err", derr)
 		}
 		return nil, status.Error(codes.Unavailable, "postgres unavailable")
@@ -95,6 +103,12 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 	}
 	return res, nil
 }
+
+// errCommitAmbiguous marks a commit whose outcome is unknown (deadline expiry,
+// connection drop): Postgres may have durably committed the batch. The PoW burn
+// must NOT be released in that case — replaying the token would credit the same
+// clicks twice, and there is no batch-level idempotency key to catch it.
+var errCommitAmbiguous = errors.New("commit outcome ambiguous")
 
 func applyBatch(ctx context.Context, pool *pgxpool.Pool, sub string, count uint32, now time.Time) (*Result, error) {
 	tx, err := pool.Begin(ctx)
@@ -126,5 +140,8 @@ func applyBatch(ctx context.Context, pool *pgxpool.Pool, sub string, count uint3
 		}
 		res.Unlocked = append(res.Unlocked, Unlock{Achievement: a, UnlockedAt: at})
 	}
-	return res, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCommitAmbiguous, err)
+	}
+	return res, nil
 }
