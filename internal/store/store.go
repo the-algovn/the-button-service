@@ -33,11 +33,35 @@ func NewPG(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := pool.Exec(ctx, Schema); err != nil {
+	// Schema application is serialized with a transaction-scoped advisory lock:
+	// CREATE TABLE IF NOT EXISTS races on the catalog when replicas start
+	// simultaneously against a fresh database, and the loser would fail fatally.
+	if err := applySchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 	return pool, nil
+}
+
+// schemaLockKey is an arbitrary constant shared by all replicas.
+const schemaLockKey int64 = 7238410394821017561
+
+// applySchema applies the idempotent schema within a transaction-scoped advisory lock.
+// This serializes concurrent DDL attempts across replicas starting simultaneously
+// against a fresh database, preventing catalog conflicts.
+func applySchema(ctx context.Context, pool *pgxpool.Pool) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", schemaLockKey); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, Schema); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // NewRedis parses REDIS_URL and verifies connectivity with a PING.

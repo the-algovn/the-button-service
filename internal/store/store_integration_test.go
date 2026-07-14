@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,6 +38,32 @@ func TestNewPG_SchemaIdempotent(t *testing.T) {
 	var unlockedAt time.Time
 	require.NoError(t, pool.QueryRow(ctx, `SELECT unlocked_at FROM user_achievements WHERE user_sub = 'u1'`).Scan(&unlockedAt))
 	require.WithinDuration(t, time.Now(), unlockedAt, time.Minute)
+}
+
+func TestNewPG_ConcurrentSchemaApply(t *testing.T) {
+	// Two replicas starting at once against a fresh DB must both succeed.
+	url := testutil.StartPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	for i := range 4 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p, err := NewPG(ctx, url)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			p.Close()
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoError(t, err, "replica %d failed to apply schema concurrently", i)
+	}
 }
 
 func TestNewRedis_Ping(t *testing.T) {
