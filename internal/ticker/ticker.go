@@ -41,6 +41,18 @@ const (
 	// would trip the >5s self-demote check above.
 	sweepInterval = 30 * time.Second
 	sweepLimit    = 500
+
+	// outboxStaleAfter bounds how old an unapplied outbox row may be before
+	// the sweeper refuses to touch it: past this age its "applied:<id>"
+	// marker may already have expired (store.AppliedMarkerTTLSeconds is 24h),
+	// so a re-apply could no longer be guaranteed idempotent. Kept well
+	// under that TTL.
+	outboxStaleAfter = 20 * time.Hour
+
+	// metricsInterval is how often the leader refreshes the observation-only
+	// divergence/outbox-depth gauges (Fix C) — its own goroutine, same
+	// reasoning as sweepLoop: never inline in the 1s tick loop.
+	metricsInterval = 60 * time.Second
 )
 
 type Ticker struct {
@@ -141,6 +153,7 @@ func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
 	leadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go t.sweepLoop(leadCtx)
+	go t.metricsLoop(leadCtx)
 
 	// initialize controller state and make sure the shared difficulty keys
 	// exist — IssueChallenge fails closed without them
@@ -354,19 +367,20 @@ func (t *Ticker) sweepLoop(ctx context.Context) {
 // entirely by keying every apply to an idempotency marker instead (spec §8).
 func (t *Ticker) sweep(ctx context.Context) error {
 	rows, err := t.Pool.Query(ctx,
-		`SELECT id, clicks FROM counter_outbox WHERE created_at < now() - interval '30 seconds' ORDER BY created_at LIMIT $1`,
+		`SELECT id, clicks, created_at FROM counter_outbox WHERE created_at < now() - interval '30 seconds' ORDER BY created_at LIMIT $1`,
 		sweepLimit)
 	if err != nil {
 		return err
 	}
 	type outboxRow struct {
-		id     string
-		clicks int64
+		id        string
+		clicks    int64
+		createdAt time.Time
 	}
 	var pending []outboxRow
 	for rows.Next() {
 		var r outboxRow
-		if err := rows.Scan(&r.id, &r.clicks); err != nil {
+		if err := rows.Scan(&r.id, &r.clicks, &r.createdAt); err != nil {
 			rows.Close()
 			return err
 		}
@@ -377,8 +391,18 @@ func (t *Ticker) sweep(ctx context.Context) error {
 	}
 	rows.Close()
 
+	staleBefore := time.Now().Add(-outboxStaleAfter)
 	applied := 0
 	for _, r := range pending {
+		// Past the marker TTL, applied:<id> may already have expired, so a
+		// re-apply is no longer guaranteed idempotent (spec: never
+		// double-count). Skip and surface it via the metric instead.
+		if r.createdAt.Before(staleBefore) {
+			t.Logger.Warn("outbox row older than applied-marker TTL, skipping to avoid double-count",
+				"id", r.id, "created_at", r.createdAt)
+			outboxStale.Inc()
+			continue
+		}
 		// Idempotent: a no-op if this id's apply already landed.
 		if err := store.ApplyCounter(ctx, t.RDB, r.id, r.clicks); err != nil {
 			if errors.Is(err, store.ErrCounterNotSeeded) {
