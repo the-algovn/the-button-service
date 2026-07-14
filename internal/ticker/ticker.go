@@ -1,6 +1,6 @@
 // Package ticker runs the per-replica counter cache and the elected tick
 // leader (spec §8): 1s counter publishes, milestone claims, the shared
-// difficulty controller, and the hourly reconcile.
+// difficulty controller, and the 30s counter-outbox sweeper.
 package ticker
 
 import (
@@ -18,6 +18,7 @@ import (
 
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/pow"
+	"github.com/the-algovn/the-button-service/internal/store"
 )
 
 // leaderLockKey identifies cluster-wide tick leadership:
@@ -28,23 +29,23 @@ const (
 	tickInterval      = time.Second
 	candidateInterval = 2 * time.Second // non-leaders poll the lock (spec §8: ~2s)
 	demoteAfter       = 5 * time.Second // self-demote when the loop lags (spec §8)
-	reconcileEvery    = time.Hour
 	counterChannel    = "the-button.counter"
-	keyCounterGlobal  = "counter:global"
 
 	// leaderCallTimeout bounds every call issued on the dedicated leader
 	// connection, below the 5s self-demote SLA so a stalled connection is
 	// detected, not waited on.
 	leaderCallTimeout = 3 * time.Second
 
-	// reconcileSettle is long enough for any in-flight Submit's post-commit
-	// INCRBY to land before a drift observation is trusted.
-	reconcileSettle = 5 * time.Second
+	// sweepInterval is how often the leader sweeps counter_outbox, in its
+	// own goroutine — never inline in the 1s tick loop, or a slow sweep
+	// would trip the >5s self-demote check above.
+	sweepInterval = 30 * time.Second
+	sweepLimit    = 500
 )
 
 type Ticker struct {
 	PGURL   string        // dedicated leader connection — never the pool
-	Pool    *pgxpool.Pool // SUM fallback + reconcile
+	Pool    *pgxpool.Pool // SUM fallback + outbox sweeper
 	RDB     *redis.Client
 	Publish func(channel string, body []byte) // best-effort; nil disables publishing
 	Logger  *slog.Logger
@@ -134,6 +135,13 @@ func (t *Ticker) dialLeaderConn(ctx context.Context) (*pgx.Conn, error) {
 }
 
 func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
+	// the sweeper runs on its own timer in its own goroutine for as long as
+	// this replica holds leadership; cancel it the moment lead() returns
+	// (demotion or shutdown) so it never outlives leadership.
+	leadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go t.sweepLoop(leadCtx)
+
 	// initialize controller state and make sure the shared difficulty keys
 	// exist — IssueChallenge fails closed without them
 	l := t.currentL(ctx)
@@ -145,7 +153,6 @@ func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
 
 	var lastPublished int64 = -1
 	lastTick := time.Now()
-	nextReconcile := time.Now().Add(reconcileEvery)
 
 	tick := time.NewTicker(tickInterval)
 	defer tick.Stop()
@@ -196,18 +203,15 @@ func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
 				t.Logger.Info("difficulty changed", "L", l, "ewma_rate", ewma)
 			}
 		}
-
-		if time.Now().After(nextReconcile) {
-			if err := t.reconcile(ctx); err != nil {
-				t.Logger.Warn("reconcile failed", "err", err)
-			}
-			nextReconcile = time.Now().Add(reconcileEvery)
-		}
 	}
 }
 
 // leaderTotal reads the hot counter, seeding it from the durable SUM when
-// missing — with SETNX, never SET, so concurrent INCRBYs survive (spec §8).
+// missing — with SETNX, never SET, so a concurrent Submit's apply (via the
+// Lua script) survives (spec §8). The SUM already reflects every committed
+// batch, so a WON seed also purges any outbox rows created at-or-before the
+// SUM's own read timestamp: left alone, the sweeper would apply them on top
+// of the seed and over-count, since their clicks are already included in it.
 func (t *Ticker) leaderTotal(ctx context.Context) (uint64, error) {
 	v, err := t.RDB.Get(ctx, "counter:global").Uint64()
 	if err == nil {
@@ -217,11 +221,20 @@ func (t *Ticker) leaderTotal(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	var sum int64
-	if err := t.Pool.QueryRow(ctx, `SELECT COALESCE(SUM(clicks), 0) FROM user_clicks`).Scan(&sum); err != nil {
+	var pgNow time.Time
+	if err := t.Pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(clicks), 0), now() FROM user_clicks`).Scan(&sum, &pgNow); err != nil {
 		return 0, err
 	}
-	if err := t.RDB.SetNX(ctx, "counter:global", sum, 0).Err(); err != nil {
+	won, err := t.RDB.SetNX(ctx, "counter:global", sum, 0).Result()
+	if err != nil {
 		return 0, err
+	}
+	if won {
+		if _, err := t.Pool.Exec(ctx,
+			`DELETE FROM counter_outbox WHERE created_at <= $1`, pgNow); err != nil {
+			t.Logger.Warn("post-seed outbox purge failed", "err", err)
+		}
 	}
 	return t.RDB.Get(ctx, "counter:global").Uint64()
 }
@@ -264,87 +277,72 @@ func (t *Ticker) currentL(ctx context.Context) uint32 {
 	return pow.MinL
 }
 
-// redisTotal reads the hot counter, treating a missing key as zero.
-func redisTotal(ctx context.Context, rdb *redis.Client) (uint64, error) {
-	v, err := rdb.Get(ctx, keyCounterGlobal).Uint64()
-	if errors.Is(err, redis.Nil) {
-		return 0, nil
+// sweepLoop runs the outbox sweeper on its own timer for as long as ctx is
+// live (leadership held) — in its own goroutine so a slow sweep can never
+// block the 1s tick loop in lead() and trip its >5s self-demote check.
+func (t *Ticker) sweepLoop(ctx context.Context) {
+	tick := time.NewTicker(sweepInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		if err := t.sweep(ctx); err != nil {
+			t.Logger.Warn("outbox sweep failed", "err", err)
+		}
 	}
-	return v, err
 }
 
-// pgTotal reads the durable SUM across all users.
-func pgTotal(ctx context.Context, pool *pgxpool.Pool) (uint64, error) {
-	var sum int64
-	if err := pool.QueryRow(ctx, `SELECT COALESCE(SUM(clicks), 0) FROM user_clicks`).Scan(&sum); err != nil {
-		return 0, err
+// sweep applies every counter_outbox row old enough to be outside the
+// in-flight window: a batch whose post-commit apply never happened (crash,
+// ambiguous commit, Redis blip). Replaces the old diff-based reconcile — no
+// diff between Postgres and Redis can distinguish a lost apply from one
+// merely in flight, since Redis structurally lags Postgres by that same
+// window (commit lands, then the apply); the outbox sidesteps the diff
+// entirely by keying every apply to an idempotency marker instead (spec §8).
+func (t *Ticker) sweep(ctx context.Context) error {
+	rows, err := t.Pool.Query(ctx,
+		`SELECT id, clicks FROM counter_outbox WHERE created_at < now() - interval '30 seconds' ORDER BY created_at LIMIT $1`,
+		sweepLimit)
+	if err != nil {
+		return err
 	}
-	return uint64(sum), nil
-}
+	type outboxRow struct {
+		id     string
+		clicks int64
+	}
+	var pending []outboxRow
+	for rows.Next() {
+		var r outboxRow
+		if err := rows.Scan(&r.id, &r.clicks); err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
 
-func abs64(v int64) int64 {
-	if v < 0 {
-		return -v
+	applied := 0
+	for _, r := range pending {
+		// Idempotent: a no-op if this id's apply already landed.
+		if err := store.ApplyCounter(ctx, t.RDB, r.id, r.clicks); err != nil {
+			t.Logger.Warn("sweep apply failed", "id", r.id, "err", err)
+			continue
+		}
+		if _, err := t.Pool.Exec(ctx, `DELETE FROM counter_outbox WHERE id = $1`, r.id); err != nil {
+			t.Logger.Warn("sweep delete failed", "id", r.id, "err", err)
+			continue
+		}
+		applied++
 	}
-	return v
-}
-
-// reconcile heals counter drift: INCRBY the delta, never SET — a SET would
-// clobber concurrent increments (spec §8).
-//
-// Read Redis BEFORE Postgres. Submit() commits to PG and only then INCRBYs
-// Redis, so with this order any batch that lands between the two reads is
-// either (a) already in the Redis value we read — and also in the later SUM,
-// so it cancels — or (b) not yet in Redis but present in SUM, making drift
-// look positive by exactly that batch, which its own pending INCRBY will
-// then apply too. To avoid double-applying (b), we require the drift to be
-// stable across a second confirming read before acting on it.
-func (t *Ticker) reconcile(ctx context.Context) error {
-	before, err := redisTotal(ctx, t.RDB)
-	if err != nil {
-		return err
+	if applied > 0 {
+		t.Logger.Info("outbox swept", "applied", applied)
 	}
-	sum, err := pgTotal(ctx, t.Pool)
-	if err != nil {
-		return err
-	}
-	drift := int64(sum) - int64(before)
-	if drift == 0 {
-		return nil
-	}
-	// Settle window: let any in-flight Submit finish its post-commit INCRBY,
-	// then recompute. Only a drift that persists is real (a lost INCRBY from a
-	// crash or an ambiguous commit), not an artifact of a batch mid-flight.
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(reconcileSettle):
-	}
-	after, err := redisTotal(ctx, t.RDB)
-	if err != nil {
-		return err
-	}
-	sum2, err := pgTotal(ctx, t.Pool)
-	if err != nil {
-		return err
-	}
-	drift2 := int64(sum2) - int64(after)
-	if drift2 == 0 {
-		return nil
-	}
-	// Apply the SMALLER magnitude of the two observations, and only when both
-	// agree in sign — a conservative correction never overshoots.
-	apply := drift2
-	if (drift > 0) != (drift2 > 0) {
-		return nil // unsettled; try again next cycle
-	}
-	if abs64(drift) < abs64(drift2) {
-		apply = drift
-	}
-	if _, err := t.RDB.IncrBy(ctx, keyCounterGlobal, apply).Result(); err != nil {
-		return err
-	}
-	t.Logger.Info("counter reconciled", "drift", apply, "pg_total", sum2, "redis_total", after)
 	return nil
 }
 

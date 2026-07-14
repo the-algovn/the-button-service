@@ -165,11 +165,24 @@ solver before launch (plan task) — never tuned assuming WebCrypto speeds.
     RETURNING clicks` → evaluate achievement rules in Go (inputs: new total,
    click_count, server time) → if unlocks:
    `INSERT INTO user_achievements ... ON CONFLICT DO NOTHING RETURNING achievement_id`
-   → COMMIT.
+   → `INSERT INTO counter_outbox (id, clicks) VALUES ($id, $n)` (the PoW
+   challenge id — already unique per batch — is the outbox row's own
+   idempotency key) → COMMIT.
    On txn failure: best-effort compensation `DEL pow:<id>`, `DEL throttle:<sub>`
-   (if DEL fails the client re-solves one challenge — accepted).
-4. After commit: `INCRBY counter:global $n` (drift healed by reconcile, §8) and
-   `INCR stats:accepted_total` (monotonic controller signal; the tick leader
+   (if DEL fails the client re-solves one challenge — accepted). If the
+   commit itself is ambiguous (deadline expiry, connection drop), the burn is
+   kept (§13) and, if the commit in fact landed, its outbox row is picked up
+   by the sweeper (§8) — closing the counter under-count an ambiguous commit
+   would otherwise leave.
+4. After commit: apply the outbox row to the public counter with a Lua
+   script — `SET applied:<id> 1 NX EX 86400` guarding `INCRBY counter:global
+   $n` — then best-effort `DELETE FROM counter_outbox WHERE id = $id`. The
+   script is idempotent (safe to re-run for the same id from a retry or the
+   sweeper), which is the point: no diff between Postgres and Redis can heal
+   this counter, because Redis structurally lags Postgres by the in-flight
+   window (commit lands, then the apply) — a diff-based reconcile cannot
+   tell a lost apply from one merely in flight (§8). Also `INCR
+   stats:accepted_total` (monotonic controller signal; the tick leader
    samples it each tick, rate = delta/dt, EWMA half-life ~30s — one key, no
    buckets, leader failover costs one tick of signal).
 5. Respond with new total, unlocks, and a fresh piggybacked challenge.
@@ -192,31 +205,54 @@ CREATE TABLE user_achievements (
   user_sub text NOT NULL, achievement_id text NOT NULL,
   unlocked_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_sub, achievement_id));
+CREATE TABLE counter_outbox (
+  id uuid PRIMARY KEY, clicks bigint NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX counter_outbox_created_at_idx ON counter_outbox (created_at);
 ```
 
 No batch log table (43M rows/day at peak would kill the shared 10Gi PV — durably
-applying the batch IS the record). Achievement catalog lives in Go code.
-pgxpool: MaxConns 10/replica, statement_timeout 2s. Budget: ~2.25 busy connections
-at the 750 txn/s engineered ceiling (Little's law, ~3ms/txn same-node).
+applying the batch IS the record). `counter_outbox` is not a batch log: it is the
+transactional outbox for the public counter (§6/§8) — one short-lived row per
+accepted batch, deleted as soon as its Redis apply lands, so it stays small
+under normal operation; the `created_at` index bounds what the sweeper scans.
+Achievement catalog lives in Go code. pgxpool: MaxConns 10/replica,
+statement_timeout 2s. Budget: ~2.25 busy connections at the 750 txn/s
+engineered ceiling (Little's law, ~3ms/txn same-node).
 
 Redis keys: `pow:<uuid>` (EX 330), `throttle:<sub>` (EX 2-10), `counter:global`,
-`milestone:<threshold>`, `pow:L`, `pow:min_interval`, `stats:accepted_total`.
+`applied:<uuid>` (EX 86400), `milestone:<threshold>`, `pow:L`, `pow:min_interval`,
+`stats:accepted_total`.
 
-## 8. Tick leader, SSE, reconciliation
+## 8. Tick leader, SSE, outbox sweeper
 
 - **Leadership**: `pg_try_advisory_lock` held on ONE dedicated non-pooled
   connection per replica attempt; leadership == that connection's health;
   self-demote (close conn) if the tick loop lags >5s; others poll every ~2s.
 - **Every 1s (leader)**: `GET counter:global` (if key missing → seed from
-  `SUM(user_clicks)`), publish `{type:"counter","total":N}` to RabbitMQ
-  `the-button.counter` when changed; detect milestone crossings →
-  `SETNX milestone:<threshold>` → publish `{type:"milestone",...}` only when the
-  SETNX won (exactly-once claim; announcement at-most-once — accepted, clients
-  also render milestones from `ListAchievements`).
-- **Hourly (leader)**: reconcile — `drift = SUM(user_clicks) - GET counter:global`;
-  if `drift != 0` → `INCRBY counter:global drift` (incremental, never SET — a SET
-  would clobber concurrent increments). Heals crash-window drift and Redis
-  restores; Postgres remains source of truth.
+  `SUM(user_clicks)`, then purge outbox rows created at-or-before the SUM's
+  own read timestamp — they're already reflected in the seed, so left alone
+  the sweeper would apply them again on top of it and over-count), publish
+  `{type:"counter","total":N}` to RabbitMQ `the-button.counter` when changed;
+  detect milestone crossings → `SETNX milestone:<threshold>` → publish
+  `{type:"milestone",...}` only when the SETNX won (exactly-once claim;
+  announcement at-most-once — accepted, clients also render milestones from
+  `ListAchievements`).
+- **Every 30s (leader, its own goroutine — never inline in the 1s tick loop,
+  or a slow sweep would trip the >5s self-demote check above)**: sweep the
+  outbox — `SELECT id, clicks FROM counter_outbox WHERE created_at < now() -
+  interval '30 seconds' ORDER BY created_at LIMIT 500` (rows younger than the
+  in-flight window may still be mid-apply, so are left alone); for each, run
+  the same idempotent Lua apply as §6 step 4 — a no-op if it already landed —
+  then delete the row. This replaces the hourly diff-based reconcile: no diff
+  between Postgres and Redis can distinguish a lost apply from one merely in
+  flight, because Redis structurally lags Postgres by the in-flight window
+  (commit lands, then the apply); at the design's target load the observed
+  drift is essentially always non-zero and positive, and "healing" it
+  double-counts the in-flight batch's own apply landing moments later. The
+  outbox sidesteps the diff entirely — every apply is idempotent and keyed by
+  the batch id, so it is safe to retry from a crash, an ambiguous commit, or
+  a Redis blip, and safe to leave untouched while genuinely in flight.
 - **Every replica**: 1s in-process cached total (`GET`, fallback `SUM`) serving
   `GetCounter` — correct from any pod, even with RabbitMQ or Redis down.
 - Controller updates (`pow:L`, `pow:min_interval`) piggyback the 1s leader tick.
@@ -322,7 +358,7 @@ Pre-launch evidence (plan tasks):
 | Redis down | Clicks fail closed (`UNAVAILABLE` → 502); counter/SSE serve from per-replica PG SUM cache; milestones pause. |
 | RabbitMQ down | SSE 503 → SPA polls GetCounter (10s±3s); clicks unaffected. |
 | Postgres down | SubmitClicks + personalized ListAchievements fail; GetCounter/SSE keep serving from Redis; bare catalog + milestones still served (code + Redis). |
-| Redis data loss | AOF restore ≈ ≤1s loss; full loss → counter reseeded from PG (reconcile), milestones re-announced once (accepted). |
+| Redis data loss | AOF restore ≈ ≤1s loss; full loss → counter reseeded from PG (§8), milestones re-announced once (accepted). |
 | Service pod loss | Stateless; leader lock re-acquired ≤2s; in-flight tokens remain valid (stateless HMAC). |
 | acp deploy | `retry:` + jittered SPA reconnect; ~250-450 anonymous reconnects/s — a non-event. |
 | Token burned but txn failed + DEL failed | Client re-solves one challenge (rare, bounded). |
