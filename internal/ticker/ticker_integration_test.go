@@ -152,7 +152,7 @@ func TestSweep_HealsLostApplyExactlyOnce(t *testing.T) {
 	require.NoError(t, rdb.Del(ctx, "applied:"+p.ID).Err())
 	require.NoError(t, rdb.Set(ctx, "counter:global", 0, 0).Err())
 	_, err = pool.Exec(ctx,
-		`INSERT INTO counter_outbox (id, clicks, created_at) VALUES ($1, $2, now() - interval '1 hour')`,
+		`INSERT INTO counter_outbox (id, clicks, created_at) VALUES ($1, $2, now() - interval '5 minutes')`,
 		p.ID, 42)
 	require.NoError(t, err)
 

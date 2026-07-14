@@ -101,7 +101,13 @@ return redis.call('GET', KEYS[2])
 // the sweeper, which only looks at rows outside the in-flight window, can
 // never re-apply an already-applied batch. Exported so the tick leader's
 // seed-purge (spec §8) can stamp markers with the same TTL as a normal apply.
-const AppliedMarkerTTLSeconds = 86400 // 24h
+//
+// Kept short (1h, not a longer horizon) because Redis has no maxmemory-policy
+// headroom to spare: at the difficulty controller's designed 200-400
+// accepted/s, one marker key per accepted batch would otherwise accumulate
+// into the tens of millions per day. ticker.go's outboxStaleAfter must stay
+// well below this value — see that constant's comment for the relationship.
+const AppliedMarkerTTLSeconds = 3600 // 1h
 
 // ErrCounterNotSeeded is returned by ApplyCounter when counter:global does
 // not exist yet — the tick leader has not seeded it from Postgres since the

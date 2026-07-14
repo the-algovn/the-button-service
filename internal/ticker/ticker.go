@@ -44,10 +44,14 @@ const (
 
 	// outboxStaleAfter bounds how old an unapplied outbox row may be before
 	// the sweeper refuses to touch it: past this age its "applied:<id>"
-	// marker may already have expired (store.AppliedMarkerTTLSeconds is 24h),
-	// so a re-apply could no longer be guaranteed idempotent. Kept well
-	// under that TTL.
-	outboxStaleAfter = 20 * time.Hour
+	// marker may already have expired (store.AppliedMarkerTTLSeconds is 1h),
+	// so a re-apply could no longer be guaranteed idempotent. Must sit
+	// strictly between the ~30s in-flight window the sweeper query already
+	// excludes (below which a row is still expected to be in flight, not
+	// orphaned) and store.AppliedMarkerTTLSeconds (above which the marker
+	// may be gone) — 30m gives wide margin on both sides of that window
+	// while still catching orphaned rows well before their marker expires.
+	outboxStaleAfter = 30 * time.Minute
 
 	// metricsInterval is how often the leader refreshes the observation-only
 	// divergence/outbox-depth gauges (Fix C) — its own goroutine, same
