@@ -1257,8 +1257,12 @@ metadata:
   namespace: zitadel
 plugin: rate-limiting
 config:
-  second: 10
-  minute: 200
+  # Login-storm / puppet-account FLOOR, not a tight limit: id.algovn.com also
+  # serves the console's static assets, and a cold page load bursts dozens of
+  # requests from one IP (10/s would 429 the console). 50/s still bounds a
+  # password-spray attacker far below Zitadel's bcrypt capacity.
+  second: 50
+  minute: 600
   policy: local
   limit_by: ip
 ```
