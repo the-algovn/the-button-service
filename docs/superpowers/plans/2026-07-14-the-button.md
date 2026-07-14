@@ -108,14 +108,19 @@ spec:
       ports:
         - { port: 8000, protocol: TCP }
         - { port: 8443, protocol: TCP }
-    # LAN direct path (documented in the Kong spec: node IP :80/:443 via svclb).
-    # Safe to allow: trusted_ips only lists the pod CIDR, so a LAN client's
-    # CF-Connecting-IP header is IGNORED by realip — no forgery risk from here.
-    # kube-system covers svclb hairpin pods whose source may be SNAT'd.
+    # LAN direct path (node IP :80/:443 via svclb). Allowed sources are ONLY the
+    # LAN subnet and Kong's own svclb hairpin pods — a namespace-wide kube-system
+    # allowance would let ANY kube-system pod reach the proxy from inside
+    # trusted_ips (10.42.0.0/16) and forge CF-Connecting-IP, reopening the exact
+    # hole this task closes.
     - from:
         - ipBlock: { cidr: 192.168.102.0/24 }
         - namespaceSelector:
             matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels:
+              svccontroller.k3s.cattle.io/svcname: kong-gateway-proxy
+              svccontroller.k3s.cattle.io/svcnamespace: kong
       ports:
         - { port: 8000, protocol: TCP }
         - { port: 8443, protocol: TCP }
