@@ -7901,7 +7901,7 @@ No code/manifest change here — this task's real deliverable is the green check
 
 **Interfaces:**
 - Consumes (frozen): PG LAN endpoint `192.168.102.201:5432` (postgres.md; never `.200`), the txn shape from spec §6/§7, the solver bench from the SPA (`?bench`, T15), `POW_W0` default `16384`.
-- Produces: recorded `pg_test_fsync` numbers, a soak percentile table, a measured mid-phone H/s, and a **decision on `POW_W0`** (update the T18 deployment env only if the chosen value ≠ 16384). Results land in `docs/superpowers/load-results.md` (created in T21; append here).
+- Produces: recorded `pg_test_fsync` numbers, a soak percentile table, a measured mid-phone H/s, and a **decision on `POW_W0`** (update the T18 deployment env only if the chosen value ≠ 16384). This task CREATES `docs/superpowers/load-results.md` with a top-level `## Calibration` section; Task 21 appends its own `## Load test results (k6)` section below it and must never overwrite this file.
 
 - [ ] **Step 1: pg_test_fsync on w1 (via the CNPG pod — pg_test_fsync ships in the postgres image)**
 
@@ -8328,14 +8328,18 @@ func solveOne(K []byte, w0, l uint64, clicks uint, subPrefix string, i int, targ
 	tokenBytes := append(append([]byte{}, pj...), mac.Sum(nil)...) // payload || HMAC
 	challenge := base64.RawURLEncoding.EncodeToString(tokenBytes)
 
-	// preimage = tokenBytes || be32(click_count) || be64(nonce)  (skeleton line 20).
-	pre := make([]byte, len(tokenBytes)+4+8)
-	copy(pre, tokenBytes)
-	binary.BigEndian.PutUint32(pre[len(tokenBytes):], uint32(clicks))
+	// preimage = tokenBytes || be32(click_count) || be64(nonce), where tokenBytes
+	// are the ASCII bytes of the CHALLENGE STRING as issued (Global Constraints;
+	// Task 8 pow.CheckWork and Task 15's solver hash exactly these bytes — never
+	// the decoded payload||HMAC).
+	tok := []byte(challenge)
+	pre := make([]byte, len(tok)+4+8)
+	copy(pre, tok)
+	binary.BigEndian.PutUint32(pre[len(tok):], uint32(clicks))
 	hashInt := new(big.Int)
 	var nonce uint64
 	for {
-		binary.BigEndian.PutUint64(pre[len(tokenBytes)+4:], nonce)
+		binary.BigEndian.PutUint64(pre[len(tok)+4:], nonce)
 		h := sha256.Sum256(pre)
 		hashInt.SetBytes(h[:])
 		if hashInt.Cmp(target) < 0 {
@@ -8581,7 +8585,7 @@ Expected: the reconnect wave drains (each VU reconnects via `sse.open`), `sse_er
 
 Repeat **sse-ramp.js** (a reduced target, e.g. 2000 VUs, is acceptable if running from a single external host) and **rollout-drill.js** from a machine OUTSIDE the LAN (e.g. a cloud VM / phone-tethered laptop) against the same public URLs — this exercises the full Cloudflare→cloudflared→Kong→acp chain and NAT-cohort rate limits (the `/events` KongPlugin `50/s,1000/min`, T4). click-soak is **not** repeated externally (service-direct by design — see the auth-bypass justification above; note this explicitly in the table).
 
-Write the results table to `the-button-service/docs/superpowers/load-results.md`:
+**APPEND** the results table to `the-button-service/docs/superpowers/load-results.md`, below the `## Calibration` section Task 20 wrote (never overwrite the file — Task 20's fsync/soak/H-s numbers and the `POW_W0` decision are the launch evidence):
 
 ```markdown
 ## Load test results (k6)
