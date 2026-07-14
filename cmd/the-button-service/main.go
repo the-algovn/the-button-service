@@ -112,7 +112,8 @@ func newPublisher(ctx context.Context, url string, logger *slog.Logger) func(str
 	var mu sync.Mutex // ticker + future callers may publish concurrently
 	var cur *conn
 	dial := func() *conn {
-		c, err := amqp.Dial(url)
+		// Bounded dial: a hung broker must not stall the leader's tick loop.
+		c, err := amqp.DialConfig(url, amqp.Config{Dial: amqp.DefaultDial(5 * time.Second)})
 		if err != nil {
 			logger.Warn("amqp dial failed", "err", err)
 			return nil

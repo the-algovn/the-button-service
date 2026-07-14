@@ -30,6 +30,16 @@ const (
 	demoteAfter       = 5 * time.Second // self-demote when the loop lags (spec §8)
 	reconcileEvery    = time.Hour
 	counterChannel    = "the-button.counter"
+	keyCounterGlobal  = "counter:global"
+
+	// leaderCallTimeout bounds every call issued on the dedicated leader
+	// connection, below the 5s self-demote SLA so a stalled connection is
+	// detected, not waited on.
+	leaderCallTimeout = 3 * time.Second
+
+	// reconcileSettle is long enough for any in-flight Submit's post-commit
+	// INCRBY to land before a drift observation is trusted.
+	reconcileSettle = 5 * time.Second
 )
 
 type Ticker struct {
@@ -90,10 +100,13 @@ func (t *Ticker) readTotal(ctx context.Context) (uint64, error) {
 // leadership == that connection's health. Closing it releases the lock.
 func (t *Ticker) leaderLoop(ctx context.Context) {
 	for {
-		conn, err := pgx.Connect(ctx, t.PGURL)
+		conn, err := t.dialLeaderConn(ctx)
 		if err == nil {
+			lctx, cancel := context.WithTimeout(ctx, leaderCallTimeout)
 			var got bool
-			if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, leaderLockKey).Scan(&got); err == nil && got {
+			err := conn.QueryRow(lctx, `SELECT pg_try_advisory_lock($1)`, leaderLockKey).Scan(&got)
+			cancel()
+			if err == nil && got {
 				t.Logger.Info("tick leadership acquired")
 				t.lead(ctx, conn)
 				t.Logger.Info("tick leadership released")
@@ -106,6 +119,18 @@ func (t *Ticker) leaderLoop(ctx context.Context) {
 		case <-time.After(candidateInterval):
 		}
 	}
+}
+
+// dialLeaderConn opens the dedicated (never-pooled) leader connection with a
+// server-side statement_timeout below the 5s self-demote SLA, so a stuck
+// statement is cancelled by Postgres rather than blocking the tick loop.
+func (t *Ticker) dialLeaderConn(ctx context.Context) (*pgx.Conn, error) {
+	cfg, err := pgx.ParseConfig(t.PGURL)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RuntimeParams["statement_timeout"] = "4000"
+	return pgx.ConnectConfig(ctx, cfg)
 }
 
 func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
@@ -138,8 +163,12 @@ func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
 		}
 		lastTick = time.Now()
 
-		// the lock connection's health IS leadership
-		if err := conn.Ping(ctx); err != nil {
+		// the lock connection's health IS leadership; bounded below the
+		// self-demote SLA so a stalled connection is detected, not waited on
+		pctx, cancel := context.WithTimeout(ctx, leaderCallTimeout)
+		err := conn.Ping(pctx)
+		cancel()
+		if err != nil {
 			t.Logger.Warn("leader connection lost", "err", err)
 			return
 		}
@@ -169,7 +198,9 @@ func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
 		}
 
 		if time.Now().After(nextReconcile) {
-			t.reconcile(ctx)
+			if err := t.reconcile(ctx); err != nil {
+				t.Logger.Warn("reconcile failed", "err", err)
+			}
 			nextReconcile = time.Now().Add(reconcileEvery)
 		}
 	}
@@ -233,25 +264,88 @@ func (t *Ticker) currentL(ctx context.Context) uint32 {
 	return pow.MinL
 }
 
+// redisTotal reads the hot counter, treating a missing key as zero.
+func redisTotal(ctx context.Context, rdb *redis.Client) (uint64, error) {
+	v, err := rdb.Get(ctx, keyCounterGlobal).Uint64()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	return v, err
+}
+
+// pgTotal reads the durable SUM across all users.
+func pgTotal(ctx context.Context, pool *pgxpool.Pool) (uint64, error) {
+	var sum int64
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(SUM(clicks), 0) FROM user_clicks`).Scan(&sum); err != nil {
+		return 0, err
+	}
+	return uint64(sum), nil
+}
+
+func abs64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
 // reconcile heals counter drift: INCRBY the delta, never SET — a SET would
 // clobber concurrent increments (spec §8).
-func (t *Ticker) reconcile(ctx context.Context) {
-	var sum int64
-	if err := t.Pool.QueryRow(ctx, `SELECT COALESCE(SUM(clicks), 0) FROM user_clicks`).Scan(&sum); err != nil {
-		t.Logger.Warn("reconcile SUM failed", "err", err)
-		return
-	}
-	cur, err := t.RDB.Get(ctx, "counter:global").Int64()
+//
+// Read Redis BEFORE Postgres. Submit() commits to PG and only then INCRBYs
+// Redis, so with this order any batch that lands between the two reads is
+// either (a) already in the Redis value we read — and also in the later SUM,
+// so it cancels — or (b) not yet in Redis but present in SUM, making drift
+// look positive by exactly that batch, which its own pending INCRBY will
+// then apply too. To avoid double-applying (b), we require the drift to be
+// stable across a second confirming read before acting on it.
+func (t *Ticker) reconcile(ctx context.Context) error {
+	before, err := redisTotal(ctx, t.RDB)
 	if err != nil {
-		t.Logger.Warn("reconcile GET failed", "err", err)
-		return
+		return err
 	}
-	if drift := sum - cur; drift != 0 {
-		t.Logger.Warn("counter drift healed", "drift", drift)
-		if err := t.RDB.IncrBy(ctx, "counter:global", drift).Err(); err != nil {
-			t.Logger.Warn("reconcile INCRBY failed", "err", err)
-		}
+	sum, err := pgTotal(ctx, t.Pool)
+	if err != nil {
+		return err
 	}
+	drift := int64(sum) - int64(before)
+	if drift == 0 {
+		return nil
+	}
+	// Settle window: let any in-flight Submit finish its post-commit INCRBY,
+	// then recompute. Only a drift that persists is real (a lost INCRBY from a
+	// crash or an ambiguous commit), not an artifact of a batch mid-flight.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(reconcileSettle):
+	}
+	after, err := redisTotal(ctx, t.RDB)
+	if err != nil {
+		return err
+	}
+	sum2, err := pgTotal(ctx, t.Pool)
+	if err != nil {
+		return err
+	}
+	drift2 := int64(sum2) - int64(after)
+	if drift2 == 0 {
+		return nil
+	}
+	// Apply the SMALLER magnitude of the two observations, and only when both
+	// agree in sign — a conservative correction never overshoots.
+	apply := drift2
+	if (drift > 0) != (drift2 > 0) {
+		return nil // unsettled; try again next cycle
+	}
+	if abs64(drift) < abs64(drift2) {
+		apply = drift
+	}
+	if _, err := t.RDB.IncrBy(ctx, keyCounterGlobal, apply).Result(); err != nil {
+		return err
+	}
+	t.Logger.Info("counter reconciled", "drift", apply, "pg_total", sum2, "redis_total", after)
+	return nil
 }
 
 func (t *Ticker) publishJSON(channel string, v any) {
