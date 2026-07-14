@@ -1,4 +1,4 @@
-// the-button-service: PoW-gated global click counter. See docs/superpowers/specs.
+// the-button-service: PoW-gated global click counter. See the-algovn/specs ARCHITECTURE.md.
 package main
 
 import (
