@@ -25,7 +25,7 @@ type Rediser interface {
 	SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.BoolCmd
 	Del(ctx context.Context, keys ...string) *redis.IntCmd
 	Incr(ctx context.Context, key string) *redis.IntCmd
-	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
+	redis.Scripter
 }
 
 // Unlock is a newly earned achievement with its database timestamp.
@@ -102,7 +102,16 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 	// apply from one merely in flight, so the counter is no longer healed by
 	// diffing (spec §6/§8).
 	if err := store.ApplyCounter(bg, rdb, p.ID, int64(count)); err != nil {
-		logger.Warn("counter apply failed", "err", err)
+		if errors.Is(err, store.ErrCounterNotSeeded) {
+			// counter:global doesn't exist yet (Redis lost its data and the
+			// tick leader hasn't re-seeded from Postgres). The batch is
+			// already committed and correct — this is not a failed click.
+			// Leave the outbox row in place; the sweeper applies it once
+			// the seed lands.
+			logger.Info("counter apply deferred: counter not seeded yet", "id", p.ID)
+		} else {
+			logger.Warn("counter apply failed", "err", err)
+		}
 	} else if _, err := pool.Exec(bg, `DELETE FROM counter_outbox WHERE id = $1`, p.ID); err != nil {
 		// best-effort: if this fails the sweeper will re-apply idempotently
 		// (a no-op, since applied:<id> is already set) and delete later

@@ -25,6 +25,10 @@ import (
 
 var logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+// setup returns a Redis client with counter:global already seeded to 0 —
+// the normal steady state assumed by these tests (Redis lost/not-yet-seeded
+// is its own scenario, covered separately in the ticker package's
+// TestApply_DoesNotCreateCounterKey).
 func setup(t *testing.T) (*redis.Client, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
@@ -34,6 +38,7 @@ func setup(t *testing.T) (*redis.Client, *pgxpool.Pool) {
 	rdb, err := store.NewRedis(ctx, testutil.StartRedis(t))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = rdb.Close() })
+	require.NoError(t, rdb.Set(ctx, "counter:global", 0, 0).Err())
 	return rdb, pool
 }
 
@@ -130,8 +135,9 @@ func TestSubmit_TxnFailureCompensates(t *testing.T) {
 	require.Equal(t, codes.Unavailable, status.Code(err))
 	// compensation removed both keys — the token is spendable again
 	require.Equal(t, int64(0), rdb.Exists(ctx, "pow:"+p.ID, "throttle:user-3").Val())
-	// and no counter bump happened for the failed attempt
-	require.Equal(t, int64(0), rdb.Exists(ctx, "counter:global").Val())
+	// and no counter bump happened for the failed attempt (setup seeds
+	// counter:global to 0; it must still read 0 after the failed txn)
+	require.Equal(t, "0", rdb.Get(ctx, "counter:global").Val())
 
 	// heal and retry the SAME token: accepted
 	_, err = pool.Exec(ctx, `ALTER TABLE user_clicks_broken RENAME TO user_clicks`)

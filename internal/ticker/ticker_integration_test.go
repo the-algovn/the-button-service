@@ -132,6 +132,12 @@ func TestSweep_HealsLostApplyExactlyOnce(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	tk := &Ticker{PGURL: pgURL, Pool: pool, RDB: rdb, Logger: logger}
 
+	// Steady state: counter:global already seeded (Fix A means Submit's own
+	// apply would otherwise leave the outbox row in place since the counter
+	// doesn't exist yet — that scenario is covered separately by
+	// TestApply_DoesNotCreateCounterKey below).
+	require.NoError(t, rdb.Set(ctx, "counter:global", 0, 0).Err())
+
 	p := sweepPayload("sweep-user")
 	res, err := clicks.Submit(ctx, rdb, pool, logger, p, 42, time.Now())
 	require.NoError(t, err)
@@ -193,6 +199,10 @@ func TestSweep_NeverDoubleCountsInFlightSubmits(t *testing.T) {
 	defer rdb.Close()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	tk := &Ticker{PGURL: pgURL, Pool: pool, RDB: rdb, Logger: logger}
+
+	// Steady state: counter:global already seeded — no leader loop runs in
+	// this test, only sweep() called directly, so nothing else would seed it.
+	require.NoError(t, rdb.Set(ctx, "counter:global", 0, 0).Err())
 
 	stop := make(chan struct{})
 	var sweepWG sync.WaitGroup
@@ -266,4 +276,126 @@ func TestLead_DemotesOnStalledConnection(t *testing.T) {
 	var timeout string
 	require.NoError(t, conn.QueryRow(ctx, `SHOW statement_timeout`).Scan(&timeout))
 	require.Equal(t, "4s", timeout, "leader connection must carry a statement_timeout below the 5s self-demote SLA")
+}
+
+// TestApply_DoesNotCreateCounterKey proves Fix A. With counter:global absent
+// (the state right after a Redis data loss — PVC loss, AOF truncation,
+// FLUSHALL — with Postgres still holding the durable total), a stray apply
+// must never spring the key into existence: INCRBY on a missing key would
+// create it at just this one batch's clicks, which permanently defeats the
+// leader's GET-succeeds-so-never-seed check and pins the public counter near
+// zero while Postgres holds millions. A Submit racing that window must still
+// succeed (the batch is durably committed either way) but leave both the
+// counter key and its own outbox row untouched — only the leader's seed may
+// create counter:global, and it must land at exactly SUM(user_clicks).
+func TestApply_DoesNotCreateCounterKey(t *testing.T) {
+	pgURL := testutil.StartPostgres(t)
+	redisURL := testutil.StartRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	pool, err := store.NewPG(ctx, pgURL)
+	require.NoError(t, err)
+	defer pool.Close()
+	rdb, err := store.NewRedis(ctx, redisURL)
+	require.NoError(t, err)
+	defer rdb.Close()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	tk := &Ticker{PGURL: pgURL, Pool: pool, RDB: rdb, Logger: logger}
+
+	// Durable history Redis knows nothing about — the point of the seed.
+	_, err = pool.Exec(ctx, `INSERT INTO user_clicks (user_sub, clicks) VALUES ('preexisting', 1000)`)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), rdb.Exists(ctx, "counter:global").Val())
+
+	// A concurrent Submit lands in this exact window: counter:global absent.
+	p := sweepPayload("wipe-user")
+	res, err := clicks.Submit(ctx, rdb, pool, logger, p, 42, time.Now())
+	require.NoError(t, err)
+	require.EqualValues(t, 42, res.UserTotal)
+
+	// The batch is committed and correct, but the counter must STILL be
+	// absent — no stray creation — and its outbox row must remain, since
+	// nothing can apply until the leader seeds.
+	require.Equal(t, int64(0), rdb.Exists(ctx, "counter:global").Val())
+	var remaining int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM counter_outbox WHERE id = $1`, p.ID).Scan(&remaining))
+	require.Equal(t, 1, remaining, "outbox row must remain until the counter is seeded")
+
+	// The leader's seed path runs next: this must be the only thing allowed
+	// to create counter:global, landing exactly on the durable sum.
+	total, err := tk.leaderTotal(ctx)
+	require.NoError(t, err)
+
+	var sum int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COALESCE(SUM(clicks), 0) FROM user_clicks`).Scan(&sum))
+	require.EqualValues(t, sum, total, "seeded total must equal SUM(user_clicks) exactly")
+	got, err := rdb.Get(ctx, "counter:global").Int64()
+	require.NoError(t, err)
+	require.EqualValues(t, sum, got)
+}
+
+// TestSeedPurge_MarksAppliedSoLateApplyIsNoop proves Fix B. A batch that
+// committed just before the leader's seed timestamp may still have its
+// post-commit apply in flight (e.g. go-redis retrying across the very Redis
+// restart that triggered the seed): its clicks are already inside the seeded
+// SUM, so if the seed purge simply deleted its outbox row, the delayed apply
+// landing afterward would find applied:<id> gone (wiped with Redis) and
+// INCRBY again — double-counting with no row left to notice. The purge must
+// mark each row's applied:<id> BEFORE deleting it, so that late apply is a
+// no-op.
+func TestSeedPurge_MarksAppliedSoLateApplyIsNoop(t *testing.T) {
+	pgURL := testutil.StartPostgres(t)
+	redisURL := testutil.StartRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	pool, err := store.NewPG(ctx, pgURL)
+	require.NoError(t, err)
+	defer pool.Close()
+	rdb, err := store.NewRedis(ctx, redisURL)
+	require.NoError(t, err)
+	defer rdb.Close()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	tk := &Ticker{PGURL: pgURL, Pool: pool, RDB: rdb, Logger: logger}
+
+	// Steady state before the Redis-loss event: the batch commits and
+	// applies normally (counter:global already seeded), so its outbox row
+	// is deleted by Submit's own successful apply.
+	require.NoError(t, rdb.Set(ctx, "counter:global", 0, 0).Err())
+	p := sweepPayload("delayed-apply-user")
+	res, err := clicks.Submit(ctx, rdb, pool, logger, p, 7, time.Now())
+	require.NoError(t, err)
+	require.EqualValues(t, 7, res.UserTotal)
+
+	// Simulate that same batch's apply instead still being in flight across
+	// the upcoming wipe: reinstate its outbox row (Submit's own apply already
+	// deleted it on this successful run) created at-or-before the seed's own
+	// read timestamp — exactly the row a delayed apply would have left
+	// behind.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO counter_outbox (id, clicks, created_at) VALUES ($1, $2, now())`,
+		p.ID, 7)
+	require.NoError(t, err)
+
+	// Redis loses everything: the marker and the counter are both gone.
+	require.NoError(t, rdb.FlushAll(ctx).Err())
+
+	// Leader seed runs: SETNX wins and purges outbox rows at-or-before its
+	// own read timestamp, including the reinstated row — marking it applied
+	// first.
+	total, err := tk.leaderTotal(ctx)
+	require.NoError(t, err)
+	var sum int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COALESCE(SUM(clicks), 0) FROM user_clicks`).Scan(&sum))
+	require.EqualValues(t, sum, total)
+
+	// The delayed apply finally lands — must be a no-op: the marker the
+	// purge stamped already claims it.
+	require.NoError(t, store.ApplyCounter(ctx, rdb, p.ID, 7))
+
+	got, err := rdb.Get(ctx, "counter:global").Int64()
+	require.NoError(t, err)
+	require.EqualValues(t, sum, got, "late apply after seed-purge must be a no-op")
 }

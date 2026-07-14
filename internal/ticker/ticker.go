@@ -231,12 +231,62 @@ func (t *Ticker) leaderTotal(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	if won {
-		if _, err := t.Pool.Exec(ctx,
-			`DELETE FROM counter_outbox WHERE created_at <= $1`, pgNow); err != nil {
-			t.Logger.Warn("post-seed outbox purge failed", "err", err)
-		}
+		t.purgeSeededOutbox(ctx, pgNow)
 	}
 	return t.RDB.Get(ctx, "counter:global").Uint64()
+}
+
+// purgeSeededOutbox handles every outbox row already reflected in the seed
+// SUM (created at-or-before pgNow). A batch that committed just before pgNow
+// may still have its post-commit apply in flight (e.g. go-redis retrying
+// across the very Redis restart that triggered this seed): its clicks are
+// already inside the SUM, and if its row were simply deleted, the delayed
+// apply would later find applied:<id> gone (wiped with Redis) and INCRBY
+// again — double-counting with no row left to notice. So each row's
+// applied:<id> marker is stamped BEFORE the row is deleted, making that
+// delayed apply a no-op. Markers before delete also means a crash mid-purge
+// leaves rows the sweeper will still pick up, but idempotently — their
+// markers already exist, so its apply is a no-op and it deletes them
+// normally on its own pass.
+func (t *Ticker) purgeSeededOutbox(ctx context.Context, pgNow time.Time) {
+	rows, err := t.Pool.Query(ctx, `SELECT id FROM counter_outbox WHERE created_at <= $1`, pgNow)
+	if err != nil {
+		t.Logger.Warn("post-seed outbox read failed", "err", err)
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			t.Logger.Warn("post-seed outbox scan failed", "err", err)
+			return
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Logger.Warn("post-seed outbox read failed", "err", err)
+		return
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return
+	}
+
+	markerTTL := time.Duration(store.AppliedMarkerTTLSeconds) * time.Second
+	pipe := t.RDB.Pipeline()
+	for _, id := range ids {
+		pipe.Set(ctx, "applied:"+id, "1", markerTTL)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		t.Logger.Warn("post-seed marker write failed", "err", err)
+		return
+	}
+
+	if _, err := t.Pool.Exec(ctx,
+		`DELETE FROM counter_outbox WHERE created_at <= $1`, pgNow); err != nil {
+		t.Logger.Warn("post-seed outbox purge failed", "err", err)
+	}
 }
 
 // claimMilestones SETNX-claims every reached threshold and publishes only a
@@ -331,6 +381,14 @@ func (t *Ticker) sweep(ctx context.Context) error {
 	for _, r := range pending {
 		// Idempotent: a no-op if this id's apply already landed.
 		if err := store.ApplyCounter(ctx, t.RDB, r.id, r.clicks); err != nil {
+			if errors.Is(err, store.ErrCounterNotSeeded) {
+				// Nothing can apply until the tick leader seeds
+				// counter:global from Postgres; every remaining row (all
+				// newer, same Redis state) would fail the same way, so stop
+				// this pass rather than re-check each one.
+				t.Logger.Info("outbox sweep stopped: counter not seeded yet", "id", r.id)
+				break
+			}
 			t.Logger.Warn("sweep apply failed", "id", r.id, "err", err)
 			continue
 		}
