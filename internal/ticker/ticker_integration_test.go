@@ -152,7 +152,14 @@ func TestSweep_HealsLostApplyExactlyOnce(t *testing.T) {
 	// its outbox delete never ran).
 	require.NoError(t, rdb.Del(ctx, "applied:"+p.ID).Err())
 	require.NoError(t, rdb.Set(ctx, "counter:global", 0, 0).Err())
-	err = db.New(pool).InsertOutboxAt(ctx, db.InsertOutboxAtParams{ID: p.ID, Clicks: 42, CreatedAt: time.Now().Add(-5 * time.Minute)})
+	// Backdate created_at with the DB clock (now() - interval), not the Go
+	// client clock: the sweep's selection filter uses now(), so a client-side
+	// timestamp would couple this fixture to host/DB clock sync (the Podman VM
+	// clock drifts). Kept as raw SQL — like the fault-injection DDL — because
+	// setting created_at is deliberately outside the production write path.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO counter_outbox (id, clicks, created_at) VALUES ($1, $2, now() - interval '5 minutes')`,
+		p.ID, 42)
 	require.NoError(t, err)
 
 	require.NoError(t, tk.sweep(ctx))

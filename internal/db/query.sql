@@ -40,9 +40,3 @@ SELECT id, clicks, created_at FROM counter_outbox
 WHERE created_at < now() - interval '30 seconds'
 ORDER BY created_at
 LIMIT $1;
-
--- name: InsertOutboxAt :exec
--- Test support: sets created_at explicitly. The production InsertOutbox always
--- DEFAULTs created_at to now(); this exists only for integration-test fixtures
--- that need a backdated row to exercise the sweeper's time window.
-INSERT INTO counter_outbox (id, clicks, created_at) VALUES ($1, $2, $3);

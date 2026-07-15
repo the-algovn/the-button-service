@@ -64,24 +64,6 @@ func (q *Queries) InsertOutbox(ctx context.Context, arg InsertOutboxParams) erro
 	return err
 }
 
-const insertOutboxAt = `-- name: InsertOutboxAt :exec
-INSERT INTO counter_outbox (id, clicks, created_at) VALUES ($1, $2, $3)
-`
-
-type InsertOutboxAtParams struct {
-	ID        string
-	Clicks    int64
-	CreatedAt time.Time
-}
-
-// Test support: sets created_at explicitly. The production InsertOutbox always
-// DEFAULTs created_at to now(); this exists only for integration-test fixtures
-// that need a backdated row to exercise the sweeper's time window.
-func (q *Queries) InsertOutboxAt(ctx context.Context, arg InsertOutboxAtParams) error {
-	_, err := q.db.Exec(ctx, insertOutboxAt, arg.ID, arg.Clicks, arg.CreatedAt)
-	return err
-}
-
 const insertUserAchievement = `-- name: InsertUserAchievement :one
 INSERT INTO user_achievements (user_sub, achievement_id) VALUES ($1, $2)
 ON CONFLICT DO NOTHING
