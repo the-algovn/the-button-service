@@ -7,6 +7,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/the-algovn/the-button-service/internal/db"
 )
 
 // These three metrics are observation-only: refreshing them never writes to
@@ -69,8 +71,8 @@ func (t *Ticker) metricsLoop(ctx context.Context) {
 // against both stores by design (Fix C) — this must never turn into an
 // auto-correction path.
 func (t *Ticker) refreshDivergenceMetrics(ctx context.Context) {
-	var sum int64
-	if err := t.Pool.QueryRow(ctx, `SELECT COALESCE(SUM(clicks), 0) FROM user_clicks`).Scan(&sum); err != nil {
+	sum, err := db.New(t.Pool).SumUserClicks(ctx)
+	if err != nil {
 		t.Logger.Warn("divergence metric: SUM read failed", "err", err)
 		return
 	}
@@ -81,8 +83,8 @@ func (t *Ticker) refreshDivergenceMetrics(ctx context.Context) {
 	}
 	counterDivergence.Set(float64(sum - counter))
 
-	var depth int
-	if err := t.Pool.QueryRow(ctx, `SELECT count(*) FROM counter_outbox`).Scan(&depth); err != nil {
+	depth, err := db.New(t.Pool).CountOutbox(ctx)
+	if err != nil {
 		t.Logger.Warn("outbox depth metric: read failed", "err", err)
 		return
 	}

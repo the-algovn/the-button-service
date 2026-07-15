@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/the-algovn/the-button-service/internal/achievements"
+	"github.com/the-algovn/the-button-service/internal/db"
 	"github.com/the-algovn/the-button-service/internal/pow"
 	"github.com/the-algovn/the-button-service/internal/store"
 )
@@ -135,8 +136,8 @@ func (t *Ticker) usersLoop(ctx context.Context) {
 func (t *Ticker) refreshUsers(ctx context.Context) {
 	cctx, cancel := context.WithTimeout(ctx, leaderCallTimeout)
 	defer cancel()
-	var n int64
-	if err := t.Pool.QueryRow(cctx, `SELECT COUNT(*) FROM user_clicks`).Scan(&n); err != nil {
+	n, err := db.New(t.Pool).CountUsers(cctx)
+	if err != nil {
 		if ctx.Err() == nil {
 			t.Logger.Warn("user count refresh failed", "err", err)
 		}
@@ -151,8 +152,8 @@ func (t *Ticker) readTotal(ctx context.Context) (uint64, error) {
 	if v, err := t.RDB.Get(ctx, "counter:global").Uint64(); err == nil {
 		return v, nil
 	}
-	var sum int64
-	if err := t.Pool.QueryRow(ctx, `SELECT COALESCE(SUM(clicks), 0) FROM user_clicks`).Scan(&sum); err != nil {
+	sum, err := db.New(t.Pool).SumUserClicks(ctx)
+	if err != nil {
 		return 0, err
 	}
 	return uint64(sum), nil
@@ -290,12 +291,11 @@ func (t *Ticker) leaderTotal(ctx context.Context) (uint64, error) {
 	if !errors.Is(err, redis.Nil) {
 		return 0, err
 	}
-	var sum int64
-	var pgNow time.Time
-	if err := t.Pool.QueryRow(ctx,
-		`SELECT COALESCE(SUM(clicks), 0), now() FROM user_clicks`).Scan(&sum, &pgNow); err != nil {
+	row, err := db.New(t.Pool).SumUserClicksNow(ctx)
+	if err != nil {
 		return 0, err
 	}
+	sum, pgNow := row.Total, row.Now
 	won, err := t.RDB.SetNX(ctx, "counter:global", sum, 0).Result()
 	if err != nil {
 		return 0, err
@@ -319,26 +319,11 @@ func (t *Ticker) leaderTotal(ctx context.Context) (uint64, error) {
 // markers already exist, so its apply is a no-op and it deletes them
 // normally on its own pass.
 func (t *Ticker) purgeSeededOutbox(ctx context.Context, pgNow time.Time) {
-	rows, err := t.Pool.Query(ctx, `SELECT id FROM counter_outbox WHERE created_at <= $1`, pgNow)
+	ids, err := db.New(t.Pool).ListOutboxBefore(ctx, pgNow)
 	if err != nil {
 		t.Logger.Warn("post-seed outbox read failed", "err", err)
 		return
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			t.Logger.Warn("post-seed outbox scan failed", "err", err)
-			return
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		t.Logger.Warn("post-seed outbox read failed", "err", err)
-		return
-	}
-	rows.Close()
 	if len(ids) == 0 {
 		return
 	}
@@ -353,8 +338,7 @@ func (t *Ticker) purgeSeededOutbox(ctx context.Context, pgNow time.Time) {
 		return
 	}
 
-	if _, err := t.Pool.Exec(ctx,
-		`DELETE FROM counter_outbox WHERE created_at <= $1`, pgNow); err != nil {
+	if err := db.New(t.Pool).DeleteOutboxBefore(ctx, pgNow); err != nil {
 		t.Logger.Warn("post-seed outbox purge failed", "err", err)
 	}
 }
@@ -423,30 +407,10 @@ func (t *Ticker) sweepLoop(ctx context.Context) {
 // window (commit lands, then the apply); the outbox sidesteps the diff
 // entirely by keying every apply to an idempotency marker instead (spec §8).
 func (t *Ticker) sweep(ctx context.Context) error {
-	rows, err := t.Pool.Query(ctx,
-		`SELECT id, clicks, created_at FROM counter_outbox WHERE created_at < now() - interval '30 seconds' ORDER BY created_at LIMIT $1`,
-		sweepLimit)
+	pending, err := db.New(t.Pool).ListSweepableOutbox(ctx, sweepLimit)
 	if err != nil {
 		return err
 	}
-	type outboxRow struct {
-		id        string
-		clicks    int64
-		createdAt time.Time
-	}
-	var pending []outboxRow
-	for rows.Next() {
-		var r outboxRow
-		if err := rows.Scan(&r.id, &r.clicks, &r.createdAt); err != nil {
-			rows.Close()
-			return err
-		}
-		pending = append(pending, r)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	rows.Close()
 
 	staleBefore := time.Now().Add(-outboxStaleAfter)
 	applied := 0
@@ -454,27 +418,27 @@ func (t *Ticker) sweep(ctx context.Context) error {
 		// Past the marker TTL, applied:<id> may already have expired, so a
 		// re-apply is no longer guaranteed idempotent (spec: never
 		// double-count). Skip and surface it via the metric instead.
-		if r.createdAt.Before(staleBefore) {
+		if r.CreatedAt.Before(staleBefore) {
 			t.Logger.Warn("outbox row older than applied-marker TTL, skipping to avoid double-count",
-				"id", r.id, "created_at", r.createdAt)
+				"id", r.ID, "created_at", r.CreatedAt)
 			outboxStale.Inc()
 			continue
 		}
 		// Idempotent: a no-op if this id's apply already landed.
-		if err := store.ApplyCounter(ctx, t.RDB, r.id, r.clicks); err != nil {
+		if err := store.ApplyCounter(ctx, t.RDB, r.ID, r.Clicks); err != nil {
 			if errors.Is(err, store.ErrCounterNotSeeded) {
 				// Nothing can apply until the tick leader seeds
 				// counter:global from Postgres; every remaining row (all
 				// newer, same Redis state) would fail the same way, so stop
 				// this pass rather than re-check each one.
-				t.Logger.Info("outbox sweep stopped: counter not seeded yet", "id", r.id)
+				t.Logger.Info("outbox sweep stopped: counter not seeded yet", "id", r.ID)
 				break
 			}
-			t.Logger.Warn("sweep apply failed", "id", r.id, "err", err)
+			t.Logger.Warn("sweep apply failed", "id", r.ID, "err", err)
 			continue
 		}
-		if _, err := t.Pool.Exec(ctx, `DELETE FROM counter_outbox WHERE id = $1`, r.id); err != nil {
-			t.Logger.Warn("sweep delete failed", "id", r.id, "err", err)
+		if err := db.New(t.Pool).DeleteOutboxByID(ctx, r.ID); err != nil {
+			t.Logger.Warn("sweep delete failed", "id", r.ID, "err", err)
 			continue
 		}
 		applied++
