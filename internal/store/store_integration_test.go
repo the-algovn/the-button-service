@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-algovn/the-button-service/internal/db"
 	"github.com/the-algovn/the-button-service/internal/testutil"
 )
 
@@ -23,7 +24,7 @@ func TestNewPG_SchemaIdempotent(t *testing.T) {
 	defer pool.Close()
 
 	// Second application must be a no-op (CREATE TABLE IF NOT EXISTS).
-	_, err = pool.Exec(ctx, Schema)
+	_, err = pool.Exec(ctx, db.Schema)
 	require.NoError(t, err)
 
 	// Both tables exist and accept the spec §7 shapes.

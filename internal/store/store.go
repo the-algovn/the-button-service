@@ -9,23 +9,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
-)
 
-// Schema is the full DDL (spec §7), idempotent so every replica applies it
-// at startup. No migration framework by design.
-const Schema = `
-CREATE TABLE IF NOT EXISTS user_clicks (user_sub text PRIMARY KEY, clicks bigint NOT NULL);
-CREATE TABLE IF NOT EXISTS user_achievements (
-  user_sub text NOT NULL, achievement_id text NOT NULL,
-  unlocked_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (user_sub, achievement_id));
-CREATE TABLE IF NOT EXISTS counter_outbox (
-  id         uuid PRIMARY KEY,
-  clicks     bigint NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS counter_outbox_created_at_idx ON counter_outbox (created_at);
-`
+	"github.com/the-algovn/the-button-service/internal/db"
+)
 
 // NewPG opens a pgx pool (MaxConns 10, statement_timeout 2s — spec §7) and
 // applies the idempotent schema.
@@ -65,7 +51,7 @@ func applySchema(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", schemaLockKey); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, Schema); err != nil {
+	if _, err := tx.Exec(ctx, db.Schema); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

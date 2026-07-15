@@ -1,0 +1,21 @@
+version: "2"
+# sqlc v1.31.1 — regenerate with `sqlc generate`, validate with `sqlc vet`.
+sql:
+  - engine: postgresql
+    schema: internal/db/schema.sql
+    queries: internal/db/query.sql
+    gen:
+      go:
+        package: db
+        out: internal/db
+        sql_package: pgx/v5
+        emit_interface: false
+        emit_json_tags: false
+        emit_empty_slices: true
+        overrides:
+          - db_type: uuid
+            go_type: string
+          - db_type: timestamptz
+            go_type:
+              import: time
+              type: Time
