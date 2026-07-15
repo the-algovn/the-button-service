@@ -28,9 +28,9 @@ func TestNewPG_SchemaIdempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Both tables exist and accept the spec §7 shapes.
-	_, err = pool.Exec(ctx, `INSERT INTO user_clicks (user_sub, clicks) VALUES ('u1', 5)`)
+	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "u1", Clicks: 5})
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, `INSERT INTO user_achievements (user_sub, achievement_id) VALUES ('u1', 'mvh')`)
+	_, err = db.New(pool).InsertUserAchievement(ctx, db.InsertUserAchievementParams{UserSub: "u1", AchievementID: "mvh"})
 	require.NoError(t, err)
 
 	var clicks int64

@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/the-algovn/the-button-service/internal/db"
 	"github.com/the-algovn/the-button-service/internal/pow"
 	"github.com/the-algovn/the-button-service/internal/store"
 	"github.com/the-algovn/the-button-service/internal/testutil"
@@ -151,7 +152,7 @@ func TestSubmit_TxnFailureCompensates(t *testing.T) {
 func TestSubmit_Crosses69(t *testing.T) {
 	rdb, pool := setup(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO user_clicks (user_sub, clicks) VALUES ('user-4', 60)`)
+	_, err := db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "user-4", Clicks: 60})
 	require.NoError(t, err)
 
 	res, err := Submit(ctx, rdb, pool, logger, payload("user-4", 1), 10, time.Now())

@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-algovn/the-button-service/internal/clicks"
+	"github.com/the-algovn/the-button-service/internal/db"
 	"github.com/the-algovn/the-button-service/internal/pow"
 	"github.com/the-algovn/the-button-service/internal/store"
 	"github.com/the-algovn/the-button-service/internal/testutil"
@@ -41,7 +42,7 @@ func TestMilestone_ExactlyOnceAcrossTwoReplicas(t *testing.T) {
 
 	// milestone-worthy durable state; counter:global is absent so the
 	// leader must seed it from SUM(user_clicks)
-	_, err = pool.Exec(ctx, `INSERT INTO user_clicks (user_sub, clicks) VALUES ('seed', 1500)`)
+	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "seed", Clicks: 1500})
 	require.NoError(t, err)
 
 	conn, err := amqp.Dial(amqpURL)
@@ -151,9 +152,7 @@ func TestSweep_HealsLostApplyExactlyOnce(t *testing.T) {
 	// its outbox delete never ran).
 	require.NoError(t, rdb.Del(ctx, "applied:"+p.ID).Err())
 	require.NoError(t, rdb.Set(ctx, "counter:global", 0, 0).Err())
-	_, err = pool.Exec(ctx,
-		`INSERT INTO counter_outbox (id, clicks, created_at) VALUES ($1, $2, now() - interval '5 minutes')`,
-		p.ID, 42)
+	err = db.New(pool).InsertOutboxAt(ctx, db.InsertOutboxAtParams{ID: p.ID, Clicks: 42, CreatedAt: time.Now().Add(-5 * time.Minute)})
 	require.NoError(t, err)
 
 	require.NoError(t, tk.sweep(ctx))
@@ -304,7 +303,7 @@ func TestApply_DoesNotCreateCounterKey(t *testing.T) {
 	tk := &Ticker{PGURL: pgURL, Pool: pool, RDB: rdb, Logger: logger}
 
 	// Durable history Redis knows nothing about — the point of the seed.
-	_, err = pool.Exec(ctx, `INSERT INTO user_clicks (user_sub, clicks) VALUES ('preexisting', 1000)`)
+	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "preexisting", Clicks: 1000})
 	require.NoError(t, err)
 	require.Equal(t, int64(0), rdb.Exists(ctx, "counter:global").Val())
 
@@ -374,9 +373,7 @@ func TestSeedPurge_MarksAppliedSoLateApplyIsNoop(t *testing.T) {
 	// deleted it on this successful run) created at-or-before the seed's own
 	// read timestamp — exactly the row a delayed apply would have left
 	// behind.
-	_, err = pool.Exec(ctx,
-		`INSERT INTO counter_outbox (id, clicks, created_at) VALUES ($1, $2, now())`,
-		p.ID, 7)
+	err = db.New(pool).InsertOutbox(ctx, db.InsertOutboxParams{ID: p.ID, Clicks: 7})
 	require.NoError(t, err)
 
 	// Redis loses everything: the marker and the counter are both gone.

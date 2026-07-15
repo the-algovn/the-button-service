@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -15,7 +16,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/the-algovn/the-button-service/internal/db"
 )
 
 func main() {
@@ -43,12 +47,8 @@ func main() {
 		log.Fatalf("ping: %v", err) // fails loudly if the DB is absent — the RED check
 	}
 
-	// Idempotent schema (mirrors spec §7).
-	mustExec(ctx, pool, `CREATE TABLE IF NOT EXISTS user_clicks (user_sub text PRIMARY KEY, clicks bigint NOT NULL)`)
-	mustExec(ctx, pool, `CREATE TABLE IF NOT EXISTS user_achievements (
-		user_sub text NOT NULL, achievement_id text NOT NULL,
-		unlocked_at timestamptz NOT NULL DEFAULT now(),
-		PRIMARY KEY (user_sub, achievement_id))`)
+	// Idempotent schema (single source: internal/db/schema.sql).
+	mustExec(ctx, pool, db.Schema)
 
 	var (
 		lat   []time.Duration
@@ -122,16 +122,11 @@ func oneTxn(ctx context.Context, pool *pgxpool.Pool, sub string) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	var total int64
-	if err := tx.QueryRow(ctx,
-		`INSERT INTO user_clicks AS u (user_sub, clicks) VALUES ($1,$2)
-		 ON CONFLICT (user_sub) DO UPDATE SET clicks = u.clicks + $2 RETURNING clicks`,
-		sub, 100).Scan(&total); err != nil {
+	q := db.New(tx)
+	if _, err := q.UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: sub, Clicks: 100}); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO user_achievements (user_sub, achievement_id) VALUES ($1,'mvh')
-		 ON CONFLICT DO NOTHING`, sub); err != nil {
+	if _, err := q.InsertUserAchievement(ctx, db.InsertUserAchievementParams{UserSub: sub, AchievementID: "mvh"}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
 	return tx.Commit(ctx)
