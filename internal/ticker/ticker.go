@@ -57,6 +57,11 @@ const (
 	// divergence/outbox-depth gauges (Fix C) — its own goroutine, same
 	// reasoning as sweepLoop: never inline in the 1s tick loop.
 	metricsInterval = 60 * time.Second
+
+	// usersRefreshInterval is how often each replica recounts distinct
+	// contributors for the display-only session stats — a slow cadence, never
+	// in the 1s tick loop.
+	usersRefreshInterval = 15 * time.Second
 )
 
 type Ticker struct {
@@ -68,6 +73,9 @@ type Ticker struct {
 
 	total     atomic.Uint64
 	haveTotal atomic.Bool
+
+	users     atomic.Uint64
+	haveUsers atomic.Bool
 }
 
 // Total returns the cached global counter and whether a value has been
@@ -76,10 +84,17 @@ func (t *Ticker) Total() (uint64, bool) {
 	return t.total.Load(), t.haveTotal.Load()
 }
 
+// Users returns the cached distinct-contributor count and whether one has been
+// loaded yet. Display-only (session stats); never load-bearing for accounting.
+func (t *Ticker) Users() (uint64, bool) {
+	return t.users.Load(), t.haveUsers.Load()
+}
+
 // Run starts the every-replica cache loop and the leader-election loop and
 // blocks until ctx is done.
 func (t *Ticker) Run(ctx context.Context) {
 	go t.cacheLoop(ctx)
+	go t.usersLoop(ctx)
 	t.leaderLoop(ctx)
 }
 
@@ -99,6 +114,36 @@ func (t *Ticker) cacheLoop(ctx context.Context) {
 		case <-tick.C:
 		}
 	}
+}
+
+// usersLoop refreshes the distinct-contributor count on a slow cadence. It is
+// display-only, so a failed refresh just keeps the last value.
+func (t *Ticker) usersLoop(ctx context.Context) {
+	t.refreshUsers(ctx)
+	tick := time.NewTicker(usersRefreshInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			t.refreshUsers(ctx)
+		}
+	}
+}
+
+func (t *Ticker) refreshUsers(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, leaderCallTimeout)
+	defer cancel()
+	var n int64
+	if err := t.Pool.QueryRow(cctx, `SELECT COUNT(*) FROM user_clicks`).Scan(&n); err != nil {
+		if ctx.Err() == nil {
+			t.Logger.Warn("user count refresh failed", "err", err)
+		}
+		return
+	}
+	t.users.Store(uint64(n))
+	t.haveUsers.Store(true)
 }
 
 // readTotal prefers Redis and falls back to the durable SUM (spec §8).
@@ -207,7 +252,11 @@ func (t *Ticker) lead(ctx context.Context, conn *pgx.Conn) {
 		// (no click traffic) is never mistaken for a stuck tick loop.
 		lastTickUnixtime.Set(float64(time.Now().Unix()))
 		if int64(total) != lastPublished {
-			t.publishJSON(counterChannel, map[string]any{"type": "counter", "total": total})
+			frame := map[string]any{"type": "counter", "total": total}
+			if users, ok := t.Users(); ok {
+				frame["users"] = users
+			}
+			t.publishJSON(counterChannel, frame)
 			t.claimMilestones(ctx, total)
 			lastPublished = int64(total)
 		}
