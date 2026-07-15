@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/the-algovn/the-button-service/internal/achievements"
+	"github.com/the-algovn/the-button-service/internal/db"
 	"github.com/the-algovn/the-button-service/internal/pow"
 	"github.com/the-algovn/the-button-service/internal/store"
 )
@@ -112,7 +113,7 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 		} else {
 			logger.Warn("counter apply failed", "err", err)
 		}
-	} else if _, err := pool.Exec(bg, `DELETE FROM counter_outbox WHERE id = $1`, p.ID); err != nil {
+	} else if err := db.New(pool).DeleteOutboxByID(bg, p.ID); err != nil {
 		// best-effort: if this fails the sweeper will re-apply idempotently
 		// (a no-op, since applied:<id> is already set) and delete later
 		logger.Warn("outbox delete failed", "id", p.ID, "err", err)
@@ -135,12 +136,9 @@ func applyBatch(ctx context.Context, pool *pgxpool.Pool, id, sub string, count u
 		return nil, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op after commit
+	q := db.New(tx)
 
-	var total int64
-	err = tx.QueryRow(ctx,
-		`INSERT INTO user_clicks AS u (user_sub, clicks) VALUES ($1, $2)
-		 ON CONFLICT (user_sub) DO UPDATE SET clicks = u.clicks + $2
-		 RETURNING clicks`, sub, int64(count)).Scan(&total)
+	total, err := q.UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: sub, Clicks: int64(count)})
 	if err != nil {
 		return nil, err
 	}
@@ -148,17 +146,13 @@ func applyBatch(ctx context.Context, pool *pgxpool.Pool, id, sub string, count u
 	// Outbox row in the SAME txn as the upsert: an ambiguous-but-landed
 	// commit (below) leaves this row for the sweeper to apply, closing the
 	// under-count that an ambiguous commit would otherwise leave.
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO counter_outbox (id, clicks) VALUES ($1, $2)`, id, int64(count)); err != nil {
+	if err := q.InsertOutbox(ctx, db.InsertOutboxParams{ID: id, Clicks: int64(count)}); err != nil {
 		return nil, err
 	}
 
 	res := &Result{UserTotal: uint64(total)}
 	for _, a := range achievements.Evaluate(uint64(total), count, now) {
-		var at time.Time
-		err := tx.QueryRow(ctx,
-			`INSERT INTO user_achievements (user_sub, achievement_id) VALUES ($1, $2)
-			 ON CONFLICT DO NOTHING RETURNING unlocked_at`, sub, a.ID).Scan(&at)
+		at, err := q.InsertUserAchievement(ctx, db.InsertUserAchievementParams{UserSub: sub, AchievementID: a.ID})
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue // unlocked in an earlier batch
 		}
