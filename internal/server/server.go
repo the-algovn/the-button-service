@@ -29,6 +29,7 @@ import (
 // Totaler is the per-replica cached counter (ticker.Ticker).
 type Totaler interface {
 	Total() (uint64, bool)
+	Users() (uint64, bool)
 }
 
 type Server struct {
@@ -72,7 +73,8 @@ func (s *Server) GetCounter(context.Context, *buttonv1.GetCounterRequest) (*butt
 	if !ok {
 		return nil, status.Error(codes.Unavailable, "counter not warmed up")
 	}
-	return &buttonv1.GetCounterResponse{Total: total}, nil
+	users, _ := s.Tick.Users() // 0 until warmed → protojson omits → client shows —
+	return &buttonv1.GetCounterResponse{Total: total, TotalUsers: users}, nil
 }
 
 // issue builds a signed challenge for sub from the shared difficulty keys.
