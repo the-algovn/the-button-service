@@ -23,6 +23,7 @@ import (
 	buttonv1 "github.com/the-algovn/protos/gen/go/algovn/button/v1"
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/clicks"
+	"github.com/the-algovn/the-button-service/internal/db"
 	"github.com/the-algovn/the-button-service/internal/pow"
 )
 
@@ -180,22 +181,12 @@ func (s *Server) ListAchievements(ctx context.Context, _ *buttonv1.ListAchieveme
 	// (anonymous rule — the header arrives verified when present, spec §4)
 	unlocked := map[string]time.Time{}
 	if sub, err := subFromContext(ctx); err == nil {
-		rows, err := s.Pool.Query(ctx,
-			`SELECT achievement_id, unlocked_at FROM user_achievements WHERE user_sub = $1`, sub)
+		rows, err := db.New(s.Pool).ListUserAchievements(ctx, sub)
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, "postgres unavailable")
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var id string
-			var at time.Time
-			if err := rows.Scan(&id, &at); err != nil {
-				return nil, status.Error(codes.Internal, "scan")
-			}
-			unlocked[id] = at
-		}
-		if rows.Err() != nil {
-			return nil, status.Error(codes.Unavailable, "postgres unavailable")
+		for _, r := range rows {
+			unlocked[r.AchievementID] = r.UnlockedAt
 		}
 	}
 
