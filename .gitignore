@@ -1,5 +1,6 @@
 bin/
 *.test
+load/sseclient/sseclient
 .DS_Store
 .superpowers/
 docs/superpowers/
