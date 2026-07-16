@@ -142,8 +142,8 @@ github.com/testcontainers/testcontainers-go/modules/rabbitmq v0.43.0 h1:+4P4pktU
 github.com/testcontainers/testcontainers-go/modules/rabbitmq v0.43.0/go.mod h1:Q4SHA2NVopiqTDR5PGoapozEzWalEgpJOrtNSOG2RUM=
 github.com/testcontainers/testcontainers-go/modules/redis v0.43.0 h1:qzATMhrltLr07KcGl/d674ouqI0AFtf6wnQb3VnqP7M=
 github.com/testcontainers/testcontainers-go/modules/redis v0.43.0/go.mod h1:ygEcEUIZzmIlOKpjBfnPn/lUIRNorr1kPj3XfFPTQXM=
-github.com/the-algovn/protos/gen/go v0.2.0 h1:4JUVHnzgZ7ckGpPx2ZD3J6lQAap3+nYFViBK4qizg7I=
-github.com/the-algovn/protos/gen/go v0.2.0/go.mod h1:R7XPFZZ4rZTL4uTugvszHktcYV+MTpGSh2lFal4ZyK0=
+github.com/the-algovn/protos/gen/go v0.3.0 h1:bnThokb1Y/c4s5JWj7jBSsJ94SysBKrnP3y7UydvYC0=
+github.com/the-algovn/protos/gen/go v0.3.0/go.mod h1:R7XPFZZ4rZTL4uTugvszHktcYV+MTpGSh2lFal4ZyK0=
 github.com/tklauser/go-sysconf v0.3.16 h1:frioLaCQSsF5Cy1jgRBrzr6t502KIIwQ0MArYICU0nA=
 github.com/tklauser/go-sysconf v0.3.16/go.mod h1:/qNL9xxDhc7tx3HSRsLWNnuzbVfh3e7gh/BmM179nYI=
 github.com/tklauser/numcpus v0.11.0 h1:nSTwhKH5e1dMNsCdVBukSZrURJRoHbSEQjdEbY+9RXw=

@@ -13,7 +13,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/rabbitmq v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/redis v0.43.0
-	github.com/the-algovn/protos/gen/go v0.2.0
+	github.com/the-algovn/protos/gen/go v0.3.0
 	google.golang.org/grpc v1.82.0
 	google.golang.org/protobuf v1.36.11
 )
