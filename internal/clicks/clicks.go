@@ -1,5 +1,5 @@
 // Package clicks implements the SubmitClicks core flow (spec §6 steps 2-4):
-// burn → throttle → durable txn → compensation → counter bump.
+// burn → throttle → durable txn → compensation → controller signal.
 package clicks
 
 import (
@@ -18,7 +18,6 @@ import (
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/db"
 	"github.com/the-algovn/the-button-service/internal/pow"
-	"github.com/the-algovn/the-button-service/internal/store"
 )
 
 // Rediser is the slice of go-redis used by Submit (satisfied by *redis.Client).
@@ -26,7 +25,6 @@ type Rediser interface {
 	SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.BoolCmd
 	Del(ctx context.Context, keys ...string) *redis.IntCmd
 	Incr(ctx context.Context, key string) *redis.IntCmd
-	redis.Scripter
 }
 
 // Unlock is a newly earned achievement with its database timestamp.
@@ -96,28 +94,10 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 		return nil, status.Error(codes.Unavailable, "postgres unavailable")
 	}
 
-	// Step 4: idempotent counter apply + controller signal. The outbox row
-	// inserted inside the txn above lets the sweeper (internal/ticker) apply
-	// this batch later if the process crashes or Redis blips before this
-	// call — a diff between Postgres and Redis can never distinguish a lost
-	// apply from one merely in flight, so the counter is no longer healed by
-	// diffing (spec §6/§8).
-	if err := store.ApplyCounter(bg, rdb, p.ID, int64(count)); err != nil {
-		if errors.Is(err, store.ErrCounterNotSeeded) {
-			// counter:global doesn't exist yet (Redis lost its data and the
-			// tick leader hasn't re-seeded from Postgres). The batch is
-			// already committed and correct — this is not a failed click.
-			// Leave the outbox row in place; the sweeper applies it once
-			// the seed lands.
-			logger.Info("counter apply deferred: counter not seeded yet", "id", p.ID)
-		} else {
-			logger.Warn("counter apply failed", "err", err)
-		}
-	} else if err := db.New(pool).DeleteOutboxByID(bg, p.ID); err != nil {
-		// best-effort: if this fails the sweeper will re-apply idempotently
-		// (a no-op, since applied:<id> is already set) and delete later
-		logger.Warn("outbox delete failed", "id", p.ID, "err", err)
-	}
+	// Step 4: controller signal. The counter itself needs no apply here —
+	// Postgres is the only counter truth and the publisher polls the SUM
+	// (2026-07-17 api-publisher split), so a committed batch is counted by
+	// construction, crash or no crash.
 	if err := rdb.Incr(bg, "stats:accepted_total").Err(); err != nil {
 		logger.Warn("stats INCR failed", "err", err)
 	}
@@ -140,13 +120,6 @@ func applyBatch(ctx context.Context, pool *pgxpool.Pool, id, sub string, count u
 
 	total, err := q.UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: sub, Clicks: int64(count)})
 	if err != nil {
-		return nil, err
-	}
-
-	// Outbox row in the SAME txn as the upsert: an ambiguous-but-landed
-	// commit (below) leaves this row for the sweeper to apply, closing the
-	// under-count that an ambiguous commit would otherwise leave.
-	if err := q.InsertOutbox(ctx, db.InsertOutboxParams{ID: id, Clicks: int64(count)}); err != nil {
 		return nil, err
 	}
 
