@@ -2,7 +2,7 @@ version: "2"
 # sqlc v1.31.1 — regenerate with `sqlc generate`, validate with `sqlc vet`.
 sql:
   - engine: postgresql
-    schema: internal/db/schema.sql
+    schema: internal/db/migrations
     queries: internal/db/query.sql
     gen:
       go:
