@@ -69,3 +69,31 @@ func env(key, fallback string) string {
 	}
 	return fallback
 }
+
+// PublisherConfig is the publisher binary's environment. No PoW secret: the
+// difficulty controller only writes pow:L, it never signs tokens.
+type PublisherConfig struct {
+	PGURL       string // PG_URL (required)
+	RedisURL    string // REDIS_URL (required)
+	AMQPURL     string // AMQP_URL (required — publishing is this binary's whole job)
+	MetricsAddr string // METRICS_ADDR (default :9091)
+}
+
+func LoadPublisher() (*PublisherConfig, error) {
+	c := &PublisherConfig{
+		PGURL:       os.Getenv("PG_URL"),
+		RedisURL:    os.Getenv("REDIS_URL"),
+		AMQPURL:     os.Getenv("AMQP_URL"),
+		MetricsAddr: env("METRICS_ADDR", ":9091"),
+	}
+	if c.PGURL == "" {
+		return nil, fmt.Errorf("PG_URL is required")
+	}
+	if c.RedisURL == "" {
+		return nil, fmt.Errorf("REDIS_URL is required")
+	}
+	if c.AMQPURL == "" {
+		return nil, fmt.Errorf("AMQP_URL is required")
+	}
+	return c, nil
+}
