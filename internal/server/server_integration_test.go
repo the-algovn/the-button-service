@@ -141,11 +141,20 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 	}
 	require.True(t, mvhUnlocked)
 
+	// user_total_clicks is seeded for the personalized caller
+	require.Equal(t, uint64(25), la.UserTotalClicks)
+
+	// a signed-in user who has never clicked has no row: zero, not an error
+	fresh, err := srv.ListAchievements(authCtx("user-never-clicked"), &buttonv1.ListAchievementsRequest{})
+	require.NoError(t, err)
+	require.Zero(t, fresh.UserTotalClicks)
+
 	anon, err := srv.ListAchievements(context.Background(), &buttonv1.ListAchievementsRequest{})
 	require.NoError(t, err)
 	require.Len(t, anon.Catalog, 12)
 	for _, a := range anon.Catalog {
 		require.Nil(t, a.UnlockedAt)
 	}
-	require.Empty(t, anon.Milestones) // total 25 — nothing reached
+	require.Empty(t, anon.Milestones)     // total 25 — nothing reached
+	require.Zero(t, anon.UserTotalClicks) // never personalized without a token
 }

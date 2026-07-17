@@ -21,6 +21,17 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const getUserClicks = `-- name: GetUserClicks :one
+SELECT clicks FROM user_clicks WHERE user_sub = $1
+`
+
+func (q *Queries) GetUserClicks(ctx context.Context, userSub string) (int64, error) {
+	row := q.db.QueryRow(ctx, getUserClicks, userSub)
+	var clicks int64
+	err := row.Scan(&clicks)
+	return clicks, err
+}
+
 const insertUserAchievement = `-- name: InsertUserAchievement :one
 INSERT INTO user_achievements (user_sub, achievement_id) VALUES ($1, $2)
 ON CONFLICT DO NOTHING

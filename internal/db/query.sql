@@ -16,3 +16,6 @@ SELECT COALESCE(SUM(clicks), 0)::bigint AS total FROM user_clicks;
 
 -- name: CountUsers :one
 SELECT COUNT(*) AS count FROM user_clicks;
+
+-- name: GetUserClicks :one
+SELECT clicks FROM user_clicks WHERE user_sub = $1;

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
@@ -181,12 +182,22 @@ func (s *Server) ListAchievements(ctx context.Context, _ *buttonv1.ListAchieveme
 	// (anonymous rule — the header arrives verified when present, spec §4)
 	unlocked := map[string]time.Time{}
 	if sub, err := subFromContext(ctx); err == nil {
-		rows, err := db.New(s.Pool).ListUserAchievements(ctx, sub)
+		q := db.New(s.Pool)
+		rows, err := q.ListUserAchievements(ctx, sub)
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, "postgres unavailable")
 		}
 		for _, r := range rows {
 			unlocked[r.AchievementID] = r.UnlockedAt
+		}
+		// No row means the user has never clicked — zero, not a failure.
+		userClicks, err := q.GetUserClicks(ctx, sub)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
+			return nil, status.Error(codes.Unavailable, "postgres unavailable")
+		default:
+			resp.UserTotalClicks = uint64(userClicks)
 		}
 	}
 
