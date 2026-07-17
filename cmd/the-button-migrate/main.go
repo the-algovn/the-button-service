@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -15,6 +16,9 @@ import (
 )
 
 func main() {
+	down := flag.Bool("down", false, "reverse the most recently applied migration instead of applying pending ones")
+	flag.Parse()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
@@ -26,6 +30,16 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	if *down {
+		reversed, err := migrate.Down(ctx, url)
+		if err != nil {
+			logger.Error("migrate down failed", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("migration reversed", "detail", reversed)
+		return
+	}
 
 	applied, err := migrate.Up(ctx, url)
 	if err != nil {

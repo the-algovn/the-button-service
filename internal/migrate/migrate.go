@@ -23,27 +23,40 @@ import (
 // against two runners racing, so the session locker does.
 const lockKey int64 = 7238410394821017561
 
+// newProvider wires the goose provider shared by Up and Down: the embedded
+// migrations, a pgx *sql.DB, and the advisory-lock session locker. On success
+// the caller owns sqlDB and must close it; on error sqlDB is already closed.
+func newProvider(url string) (p *goose.Provider, sqlDB *sql.DB, err error) {
+	sub, err := fs.Sub(db.Migrations, "migrations")
+	if err != nil {
+		return nil, nil, err
+	}
+	sqlDB, err = sql.Open("pgx", url)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	locker, err := lock.NewPostgresSessionLocker(lock.WithLockID(lockKey))
+	if err != nil {
+		sqlDB.Close()
+		return nil, nil, err
+	}
+	p, err = goose.NewProvider(goose.DialectPostgres, sqlDB, sub, goose.WithSessionLocker(locker))
+	if err != nil {
+		sqlDB.Close()
+		return nil, nil, err
+	}
+	return p, sqlDB, nil
+}
+
 // Up applies every pending migration to url and returns one line per applied
 // migration — empty when there was nothing to do.
 func Up(ctx context.Context, url string) ([]string, error) {
-	sub, err := fs.Sub(db.Migrations, "migrations")
-	if err != nil {
-		return nil, err
-	}
-	sqlDB, err := sql.Open("pgx", url)
+	p, sqlDB, err := newProvider(url)
 	if err != nil {
 		return nil, err
 	}
 	defer sqlDB.Close()
-
-	locker, err := lock.NewPostgresSessionLocker(lock.WithLockID(lockKey))
-	if err != nil {
-		return nil, err
-	}
-	p, err := goose.NewProvider(goose.DialectPostgres, sqlDB, sub, goose.WithSessionLocker(locker))
-	if err != nil {
-		return nil, err
-	}
 
 	results, err := p.Up(ctx)
 	if err != nil {
@@ -55,4 +68,23 @@ func Up(ctx context.Context, url string) ([]string, error) {
 			r.Source.Version, r.Source.Path, r.Empty, r.Duration))
 	}
 	return applied, nil
+}
+
+// Down reverses exactly the one most-recently-applied migration and returns a
+// human-readable line describing what was reversed, mirroring Up's line
+// format. There is no way to reverse more than one migration per call — that
+// is goose's contract, not a limitation added here.
+func Down(ctx context.Context, url string) (string, error) {
+	p, sqlDB, err := newProvider(url)
+	if err != nil {
+		return "", err
+	}
+	defer sqlDB.Close()
+
+	r, err := p.Down(ctx)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("version=%d path=%s empty=%t duration=%s",
+		r.Source.Version, r.Source.Path, r.Empty, r.Duration), nil
 }

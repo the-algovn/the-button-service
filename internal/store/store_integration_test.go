@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/migrate"
 	"github.com/the-algovn/the-button-service/internal/testutil"
 )
 
@@ -138,6 +139,42 @@ func TestMigrate_ConcurrentRunnersSerialize(t *testing.T) {
 	var applied int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM goose_db_version WHERE version_id > 0`).Scan(&applied))
 	require.Equal(t, 2, applied, "each migration must be recorded exactly once")
+}
+
+// TestMigrate_DownRecreatesCounterOutbox proves the runbook's rollback claim
+// for real: rolling a fresh, fully-migrated database back by one migration
+// recreates counter_outbox — the exact scenario a rollback to a pre-split
+// image (whose write path INSERTs there on every accepted batch) needs.
+func TestMigrate_DownRecreatesCounterOutbox(t *testing.T) {
+	url := testutil.StartPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	testutil.Migrate(t, url) // applies 001+002; counter_outbox is dropped by 002
+
+	pool, err := NewPG(ctx, url)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	var before int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'counter_outbox'`).Scan(&before))
+	require.Zero(t, before, "precondition: counter_outbox must be dropped before rollback")
+
+	reversed, err := migrate.Down(ctx, url)
+	require.NoError(t, err)
+	require.Contains(t, reversed, "version=2", "Down must reverse migration 002, the most recently applied")
+
+	var after int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'counter_outbox'`).Scan(&after))
+	require.Equal(t, 1, after, "migrate -down must recreate counter_outbox")
+
+	// goose_db_version reflects the reversal: version 2's row is gone, leaving
+	// 1 as the highest recorded version.
+	var version int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version`).Scan(&version))
+	require.EqualValues(t, 1, version, "goose_db_version must reflect the reversal of migration 002")
 }
 
 func TestNewRedis_Ping(t *testing.T) {
