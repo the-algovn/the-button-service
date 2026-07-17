@@ -94,17 +94,31 @@ func Down(ctx context.Context, url string, force bool) (string, error) {
 	}
 	defer sqlDB.Close()
 
-	if !force {
-		version, err := p.GetDBVersion(ctx)
+	var r *goose.MigrationResult
+	if force {
+		r, err = p.Down(ctx)
+	} else {
+		var version int64
+		version, err = p.GetDBVersion(ctx)
 		if err != nil {
 			return "", err
 		}
 		if version <= minSafeDownVersion {
 			return "", fmt.Errorf("refusing to reverse migration 001 (current version=%d): its Down DROPS user_clicks and user_achievements — every click and achievement in production; pass -force-destructive only for a throwaway/dev database", version)
 		}
+		// Pin the reversal to exactly the version just checked instead of
+		// calling p.Down (which would reverse whatever is latest at the
+		// time it runs, not at the time the guard checked). GetDBVersion
+		// above acquires the advisory lock, reads, and releases it; without
+		// this pin, two concurrent unforced Downs could both read version=2,
+		// both pass the guard, and the second (racing in after the first
+		// already reversed 002) would go on to reverse 001. ApplyVersion
+		// re-acquires the same advisory lock and re-verifies under it that
+		// this exact version is still applied before running its Down, so
+		// the second caller gets ErrNotApplied instead of silently
+		// destroying production data.
+		r, err = p.ApplyVersion(ctx, version, false)
 	}
-
-	r, err := p.Down(ctx)
 	if err != nil {
 		return "", err
 	}
