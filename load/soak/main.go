@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/migrate"
 )
 
 func main() {
@@ -47,8 +48,12 @@ func main() {
 		log.Fatalf("ping: %v", err) // fails loudly if the DB is absent — the RED check
 	}
 
-	// Idempotent schema (single source: internal/db/schema.sql).
-	mustExec(ctx, pool, db.Schema)
+	// Schema comes from the same migrations production runs (single source:
+	// internal/db/migrations) — the soak DB is throwaway, so applying them
+	// here keeps the tool self-contained.
+	if _, err := migrate.Up(ctx, *dsn); err != nil {
+		log.Fatalf("migrate: %v", err)
+	}
 
 	var (
 		lat   []time.Duration
@@ -130,12 +135,6 @@ func oneTxn(ctx context.Context, pool *pgxpool.Pool, sub string) error {
 		return err
 	}
 	return tx.Commit(ctx)
-}
-
-func mustExec(ctx context.Context, pool *pgxpool.Pool, sql string) {
-	if _, err := pool.Exec(ctx, sql); err != nil {
-		log.Fatalf("exec %q: %v", sql, err)
-	}
 }
 
 func pct(sorted []time.Duration, p int) time.Duration {
