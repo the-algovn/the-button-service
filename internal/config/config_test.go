@@ -23,7 +23,6 @@ func TestLoad_DefaultsAndDecoding(t *testing.T) {
 	require.Equal(t, uint64(16384), c.PowW0)
 	require.Len(t, c.PowSecret, 32)
 	require.Nil(t, c.PowSecretPrev)
-	require.Empty(t, c.AMQPURL) // optional: events are best-effort
 }
 
 func TestLoad_MissingRequired(t *testing.T) {

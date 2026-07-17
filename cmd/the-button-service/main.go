@@ -18,10 +18,9 @@ import (
 
 	buttonv1 "github.com/the-algovn/protos/gen/go/algovn/button/v1"
 	"github.com/the-algovn/the-button-service/internal/config"
-	"github.com/the-algovn/the-button-service/internal/publisher"
+	"github.com/the-algovn/the-button-service/internal/countercache"
 	"github.com/the-algovn/the-button-service/internal/server"
 	"github.com/the-algovn/the-button-service/internal/store"
-	"github.com/the-algovn/the-button-service/internal/ticker"
 )
 
 func main() {
@@ -51,25 +50,15 @@ func main() {
 	}
 	defer rdb.Close()
 
-	var publish func(string, []byte)
-	if cfg.AMQPURL != "" {
-		publish = publisher.NewAMQPPublisher(ctx, cfg.AMQPURL, logger)
-	} else {
-		logger.Warn("AMQP_URL not set; counter events will not publish")
-	}
-
-	tick := &ticker.Ticker{
-		PGURL: cfg.PGURL, Pool: pool, RDB: rdb,
-		Publish: publish, Logger: logger,
-	}
-	go tick.Run(ctx)
+	cache := &countercache.Cache{Pool: pool, Logger: logger}
+	go cache.Run(ctx)
 
 	keys := [][]byte{cfg.PowSecret}
 	if cfg.PowSecretPrev != nil {
 		keys = append(keys, cfg.PowSecretPrev)
 	}
 	srv := &server.Server{
-		Pool: pool, RDB: rdb, Tick: tick, Logger: logger,
+		Pool: pool, RDB: rdb, Tick: cache, Logger: logger,
 		W0: cfg.PowW0, Keys: keys,
 	}
 
