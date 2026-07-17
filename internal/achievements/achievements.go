@@ -34,7 +34,7 @@ var Catalog = []Achievement{
 	{"lunch", "Lunch Break Rebel", "Clicked between noon and one. The sandwich can wait."},
 }
 
-// Milestones are the global thresholds announced by the tick leader
+// Milestones are the global thresholds announced by the publisher
 // (spec §9), ascending.
 var Milestones = []Milestone{
 	{1_000, "A Thousand Tiny Rebellions"},

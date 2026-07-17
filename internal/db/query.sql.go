@@ -10,17 +10,6 @@ import (
 	"time"
 )
 
-const countOutbox = `-- name: CountOutbox :one
-SELECT COUNT(*) AS count FROM counter_outbox
-`
-
-func (q *Queries) CountOutbox(ctx context.Context) (int64, error) {
-	row := q.db.QueryRow(ctx, countOutbox)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const countUsers = `-- name: CountUsers :one
 SELECT COUNT(*) AS count FROM user_clicks
 `
@@ -30,38 +19,6 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 	var count int64
 	err := row.Scan(&count)
 	return count, err
-}
-
-const deleteOutboxBefore = `-- name: DeleteOutboxBefore :exec
-DELETE FROM counter_outbox WHERE created_at <= $1
-`
-
-func (q *Queries) DeleteOutboxBefore(ctx context.Context, createdAt time.Time) error {
-	_, err := q.db.Exec(ctx, deleteOutboxBefore, createdAt)
-	return err
-}
-
-const deleteOutboxByID = `-- name: DeleteOutboxByID :exec
-DELETE FROM counter_outbox WHERE id = $1
-`
-
-func (q *Queries) DeleteOutboxByID(ctx context.Context, id string) error {
-	_, err := q.db.Exec(ctx, deleteOutboxByID, id)
-	return err
-}
-
-const insertOutbox = `-- name: InsertOutbox :exec
-INSERT INTO counter_outbox (id, clicks) VALUES ($1, $2)
-`
-
-type InsertOutboxParams struct {
-	ID     string
-	Clicks int64
-}
-
-func (q *Queries) InsertOutbox(ctx context.Context, arg InsertOutboxParams) error {
-	_, err := q.db.Exec(ctx, insertOutbox, arg.ID, arg.Clicks)
-	return err
 }
 
 const insertUserAchievement = `-- name: InsertUserAchievement :one
@@ -80,57 +37,6 @@ func (q *Queries) InsertUserAchievement(ctx context.Context, arg InsertUserAchie
 	var unlocked_at time.Time
 	err := row.Scan(&unlocked_at)
 	return unlocked_at, err
-}
-
-const listOutboxBefore = `-- name: ListOutboxBefore :many
-SELECT id FROM counter_outbox WHERE created_at <= $1
-`
-
-func (q *Queries) ListOutboxBefore(ctx context.Context, createdAt time.Time) ([]string, error) {
-	rows, err := q.db.Query(ctx, listOutboxBefore, createdAt)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []string{}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		items = append(items, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listSweepableOutbox = `-- name: ListSweepableOutbox :many
-SELECT id, clicks, created_at FROM counter_outbox
-WHERE created_at < now() - interval '30 seconds'
-ORDER BY created_at
-LIMIT $1
-`
-
-func (q *Queries) ListSweepableOutbox(ctx context.Context, limit int32) ([]CounterOutbox, error) {
-	rows, err := q.db.Query(ctx, listSweepableOutbox, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []CounterOutbox{}
-	for rows.Next() {
-		var i CounterOutbox
-		if err := rows.Scan(&i.ID, &i.Clicks, &i.CreatedAt); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const listUserAchievements = `-- name: ListUserAchievements :many
@@ -171,22 +77,6 @@ func (q *Queries) SumUserClicks(ctx context.Context) (int64, error) {
 	var total int64
 	err := row.Scan(&total)
 	return total, err
-}
-
-const sumUserClicksNow = `-- name: SumUserClicksNow :one
-SELECT COALESCE(SUM(clicks), 0)::bigint AS total, now()::timestamptz AS now FROM user_clicks
-`
-
-type SumUserClicksNowRow struct {
-	Total int64
-	Now   time.Time
-}
-
-func (q *Queries) SumUserClicksNow(ctx context.Context) (SumUserClicksNowRow, error) {
-	row := q.db.QueryRow(ctx, sumUserClicksNow)
-	var i SumUserClicksNowRow
-	err := row.Scan(&i.Total, &i.Now)
-	return i, err
 }
 
 const upsertUserClicks = `-- name: UpsertUserClicks :one

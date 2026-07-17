@@ -8,12 +8,6 @@ import (
 	"time"
 )
 
-type CounterOutbox struct {
-	ID        string
-	Clicks    int64
-	CreatedAt time.Time
-}
-
 type UserAchievement struct {
 	UserSub       string
 	AchievementID string

@@ -16,10 +16,11 @@ import (
 	"google.golang.org/grpc/status"
 
 	buttonv1 "github.com/the-algovn/protos/gen/go/algovn/button/v1"
+	"github.com/the-algovn/the-button-service/internal/countercache"
 	"github.com/the-algovn/the-button-service/internal/pow"
+	"github.com/the-algovn/the-button-service/internal/publisher"
 	"github.com/the-algovn/the-button-service/internal/store"
 	"github.com/the-algovn/the-button-service/internal/testutil"
-	"github.com/the-algovn/the-button-service/internal/ticker"
 )
 
 func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
@@ -54,13 +55,15 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 			amqp.Publishing{ContentType: "application/json", Body: body})
 	}
 
-	tick := &ticker.Ticker{PGURL: pgURL, Pool: pool, RDB: rdb, Publish: publish, Logger: logger}
-	go tick.Run(ctx)
+	pub := &publisher.Publisher{Pool: pool, RDB: rdb, Publish: publish, Logger: logger}
+	go pub.Run(ctx)
+	cache := &countercache.Cache{Pool: pool, Logger: logger}
+	go cache.Run(ctx)
 
 	key := []byte("integration-test-key-0123456789a")
-	srv := &Server{Pool: pool, RDB: rdb, Tick: tick, Logger: logger, W0: 4, Keys: [][]byte{key}}
+	srv := &Server{Pool: pool, RDB: rdb, Tick: cache, Logger: logger, W0: 4, Keys: [][]byte{key}}
 
-	// fails closed until the leader writes pow:L / pow:min_interval
+	// fails closed until the publisher writes pow:L / pow:min_interval
 	require.Eventually(t, func() bool {
 		_, err := srv.IssueChallenge(authCtx("user-1"), &buttonv1.IssueChallengeRequest{})
 		return status.Code(err) != codes.Unavailable
@@ -97,7 +100,7 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 	})
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 
-	// the tick leader publishes the new total on the counter channel
+	// the publisher broadcasts the new total on the counter channel
 	waitFor := func(wantTotal uint64) {
 		t.Helper()
 		deadline := time.After(15 * time.Second)

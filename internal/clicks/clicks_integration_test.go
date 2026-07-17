@@ -26,10 +26,9 @@ import (
 
 var logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-// setup returns a Redis client with counter:global already seeded to 0 —
-// the normal steady state assumed by these tests (Redis lost/not-yet-seeded
-// is its own scenario, covered separately in the ticker package's
-// TestApply_DoesNotCreateCounterKey).
+// setup returns a Redis client and a PG pool. No counter seeding: since the
+// outbox removal, Redis holds no counter state — Postgres is the only
+// counter truth.
 func setup(t *testing.T) (*redis.Client, *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
@@ -39,13 +38,11 @@ func setup(t *testing.T) (*redis.Client, *pgxpool.Pool) {
 	rdb, err := store.NewRedis(ctx, testutil.StartRedis(t))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = rdb.Close() })
-	require.NoError(t, rdb.Set(ctx, "counter:global", 0, 0).Err())
 	return rdb, pool
 }
 
-// payload's ID must be a valid uuid (the outbox table's primary key column
-// is uuid — spec §7), so it is generated here rather than taken as a
-// caller-supplied label.
+// payload's ID stays a uuid: it is the Redis burn key ("pow:<id>") and shows
+// up in logs — uuid keeps those unambiguous even though nothing enforces it.
 func payload(sub string, minInterval uint32) pow.Payload {
 	now := time.Now()
 	return pow.Payload{
@@ -62,6 +59,13 @@ func unlockedIDs(res *Result) []string {
 	return out
 }
 
+func sumClicks(t *testing.T, ctx context.Context, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	n, err := db.New(pool).SumUserClicks(ctx)
+	require.NoError(t, err)
+	return n
+}
+
 func TestSubmit_HappyPathAndReplay(t *testing.T) {
 	rdb, pool := setup(t)
 	ctx := context.Background()
@@ -72,35 +76,13 @@ func TestSubmit_HappyPathAndReplay(t *testing.T) {
 	require.EqualValues(t, 5, res.UserTotal)
 	require.Contains(t, unlockedIDs(res), "mvh")
 
-	// step 4 side effects: hot counter + controller signal
-	require.Equal(t, "5", rdb.Get(ctx, "counter:global").Val())
+	// side effects: durable truth + controller signal
+	require.EqualValues(t, 5, sumClicks(t, ctx, pool))
 	require.Equal(t, "1", rdb.Get(ctx, "stats:accepted_total").Val())
 
 	// replay: the same challenge id is burned
 	_, err = Submit(ctx, rdb, pool, logger, p, 5, time.Now())
 	require.Equal(t, codes.AlreadyExists, status.Code(err))
-}
-
-// TestSubmit_AppliesCounterAndClearsOutbox proves the happy path of the
-// transactional outbox (spec §6): after a successful Submit, counter:global
-// equals the batch's clicks, the idempotency marker applied:<id> exists, and
-// the outbox row inserted alongside the user_clicks upsert is gone.
-func TestSubmit_AppliesCounterAndClearsOutbox(t *testing.T) {
-	rdb, pool := setup(t)
-	ctx := context.Background()
-	p := payload("user-outbox", 1)
-
-	res, err := Submit(ctx, rdb, pool, logger, p, 7, time.Now())
-	require.NoError(t, err)
-	require.EqualValues(t, 7, res.UserTotal)
-
-	require.Equal(t, "7", rdb.Get(ctx, "counter:global").Val())
-	require.Equal(t, int64(1), rdb.Exists(ctx, "applied:"+p.ID).Val())
-
-	var remaining int
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT count(*) FROM counter_outbox WHERE id = $1`, p.ID).Scan(&remaining))
-	require.Zero(t, remaining, "outbox row must be deleted after a successful apply")
 }
 
 func TestSubmit_ThrottleUnburnsToken(t *testing.T) {
@@ -136,17 +118,16 @@ func TestSubmit_TxnFailureCompensates(t *testing.T) {
 	require.Equal(t, codes.Unavailable, status.Code(err))
 	// compensation removed both keys — the token is spendable again
 	require.Equal(t, int64(0), rdb.Exists(ctx, "pow:"+p.ID, "throttle:user-3").Val())
-	// and no counter bump happened for the failed attempt (setup seeds
-	// counter:global to 0; it must still read 0 after the failed txn)
-	require.Equal(t, "0", rdb.Get(ctx, "counter:global").Val())
 
 	// heal and retry the SAME token: accepted
 	_, err = pool.Exec(ctx, `ALTER TABLE user_clicks_broken RENAME TO user_clicks`)
 	require.NoError(t, err)
+	// and no counter bump happened for the failed attempt
+	require.Zero(t, sumClicks(t, ctx, pool))
 	res, err := Submit(ctx, rdb, pool, logger, p, 3, time.Now())
 	require.NoError(t, err)
 	require.EqualValues(t, 3, res.UserTotal)
-	require.Equal(t, "3", rdb.Get(ctx, "counter:global").Val())
+	require.EqualValues(t, 3, sumClicks(t, ctx, pool))
 }
 
 func TestSubmit_Crosses69(t *testing.T) {
@@ -230,7 +211,7 @@ func TestApplyBatch_CommitErrorWrappedAmbiguous(t *testing.T) {
 
 	dctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancel()
-	_, err := applyBatch(dctx, pool, uuid.New().String(), "user-ambig-direct", 1, time.Now())
+	_, err := applyBatch(dctx, pool, "user-ambig-direct", 1, time.Now())
 	require.Error(t, err)
 	require.ErrorIs(t, err, errCommitAmbiguous)
 }

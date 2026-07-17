@@ -11,7 +11,6 @@ import (
 type Config struct {
 	PGURL         string // PG_URL (required)
 	RedisURL      string // REDIS_URL (required)
-	AMQPURL       string // AMQP_URL (optional; counter events are best-effort)
 	PowSecret     []byte // POW_SECRET (required, std-base64 of 32 raw bytes)
 	PowSecretPrev []byte // POW_SECRET_PREV (optional, rotation window)
 	PowW0         uint64 // POW_W0 (default 16384 = 2^14 expected hashes/click)
@@ -23,7 +22,6 @@ func Load() (*Config, error) {
 	c := &Config{
 		PGURL:       os.Getenv("PG_URL"),
 		RedisURL:    os.Getenv("REDIS_URL"),
-		AMQPURL:     os.Getenv("AMQP_URL"),
 		ListenAddr:  env("LISTEN_ADDR", ":9090"),
 		MetricsAddr: env("METRICS_ADDR", ":9091"),
 	}
@@ -68,4 +66,32 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// PublisherConfig is the publisher binary's environment. No PoW secret: the
+// difficulty controller only writes pow:L, it never signs tokens.
+type PublisherConfig struct {
+	PGURL       string // PG_URL (required)
+	RedisURL    string // REDIS_URL (required)
+	AMQPURL     string // AMQP_URL (required — publishing is this binary's whole job)
+	MetricsAddr string // METRICS_ADDR (default :9091)
+}
+
+func LoadPublisher() (*PublisherConfig, error) {
+	c := &PublisherConfig{
+		PGURL:       os.Getenv("PG_URL"),
+		RedisURL:    os.Getenv("REDIS_URL"),
+		AMQPURL:     os.Getenv("AMQP_URL"),
+		MetricsAddr: env("METRICS_ADDR", ":9091"),
+	}
+	if c.PGURL == "" {
+		return nil, fmt.Errorf("PG_URL is required")
+	}
+	if c.RedisURL == "" {
+		return nil, fmt.Errorf("REDIS_URL is required")
+	}
+	if c.AMQPURL == "" {
+		return nil, fmt.Errorf("AMQP_URL is required")
+	}
+	return c, nil
 }

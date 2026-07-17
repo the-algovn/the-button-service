@@ -1,10 +1,13 @@
-// Package store wires Postgres (durable personal truth) and Redis (hot
-// control state) per the design spec §7.
+// Package store wires Postgres (durable truth — and since the outbox
+// removal, the ONLY counter truth) and Redis (hot control state: PoW,
+// throttle, difficulty, milestones). Redis maxmemory-policy MUST be
+// noeviction: the PoW burn keys (pow:<id>) are what prevent challenge
+// replay/double-credit, so evicting one under memory pressure is a
+// correctness bug, not just a cache miss.
 package store
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -55,78 +58,6 @@ func applySchema(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	return tx.Commit(ctx)
-}
-
-// ApplyCounterScript idempotently applies a batch's clicks to counter:global,
-// keyed by the batch's outbox id (its PoW challenge id, spec §6/§8). A diff
-// between Postgres and Redis can never tell a lost increment from one merely
-// in flight, so the counter is no longer healed by diffing: this script is
-// safe to run any number of times for the same id — from the write path
-// right after commit, or later from the outbox sweeper — because the
-// "applied:<id>" marker only ever transitions once.
-//
-// It refuses to CREATE counter:global: a bare INCRBY on a missing key springs
-// it into existence at whatever this one batch's clicks happen to be, which
-// would let a stray apply that races the tick leader's seed (after a Redis
-// data loss — PVC loss, AOF truncation, FLUSHALL — with Postgres still
-// holding the durable total) pin the public counter near zero forever, since
-// the leader's own seed-on-missing-key check would then never fire again.
-// Callers get ErrCounterNotSeeded back and must leave their outbox row in
-// place for the sweeper to retry once the leader has seeded the counter.
-const ApplyCounterScript = `
-if redis.call('EXISTS', KEYS[2]) == 0 then
-  return -1
-end
-if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
-  return redis.call('INCRBY', KEYS[2], ARGV[1])
-end
-return redis.call('GET', KEYS[2])
-`
-
-// AppliedMarkerTTLSeconds bounds the "applied:<id>" marker: long enough that
-// the sweeper, which only looks at rows outside the in-flight window, can
-// never re-apply an already-applied batch. Exported so the tick leader's
-// seed-purge (spec §8) can stamp markers with the same TTL as a normal apply.
-//
-// Kept short (1h, not a longer horizon) because Redis has no maxmemory-policy
-// headroom to spare: at the difficulty controller's designed 200-400
-// accepted/s, one marker key per accepted batch would otherwise accumulate
-// into the tens of millions per day. ticker.go's outboxStaleAfter must stay
-// well below this value — see that constant's comment for the relationship.
-const AppliedMarkerTTLSeconds = 3600 // 1h
-
-// ErrCounterNotSeeded is returned by ApplyCounter when counter:global does
-// not exist yet — the tick leader has not seeded it from Postgres since the
-// last time Redis lost its data. Callers must leave their outbox row in
-// place: nothing can apply until the seed lands, and the sweeper (or a later
-// retry of this same call) will pick it up then.
-var ErrCounterNotSeeded = errors.New("counter not seeded")
-
-// applyCounterScript wraps ApplyCounterScript for EVALSHA-with-fallback
-// (Fix D): the script body is loaded once and cached server-side instead of
-// being shipped on every call.
-var applyCounterScript = redis.NewScript(ApplyCounterScript)
-
-// Scripter is the redis client capability ApplyCounter needs to run a
-// server-side script.
-type Scripter = redis.Scripter
-
-// ApplyCounter runs ApplyCounterScript for outbox row id against
-// counter:global. Redis maxmemory-policy MUST be noeviction: counter:global
-// and applied:* are load-bearing for exactly-once accounting, and an
-// eviction under memory pressure would silently corrupt the public counter
-// the same way a data loss would (this must be set on the Redis platform
-// component — see the-algovn/specs).
-func ApplyCounter(ctx context.Context, rdb Scripter, id string, clicks int64) error {
-	n, err := applyCounterScript.Run(ctx, rdb,
-		[]string{"applied:" + id, "counter:global"}, clicks, AppliedMarkerTTLSeconds).Int64()
-	if err != nil {
-		return err
-	}
-	if n == -1 {
-		return ErrCounterNotSeeded
-	}
-	return nil
 }
 
 // NewRedis parses REDIS_URL and verifies connectivity with a PING.

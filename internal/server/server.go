@@ -27,7 +27,7 @@ import (
 	"github.com/the-algovn/the-button-service/internal/pow"
 )
 
-// Totaler is the per-replica cached counter (ticker.Ticker).
+// Totaler is the per-replica cached counter (countercache.Cache).
 type Totaler interface {
 	Total() (uint64, bool)
 	Users() (uint64, bool)
@@ -80,7 +80,7 @@ func (s *Server) GetCounter(context.Context, *buttonv1.GetCounterRequest) (*butt
 
 // issue builds a signed challenge for sub from the shared difficulty keys.
 // Fails closed: Redis miss/error → Unavailable — no local defaults, the
-// leader owns pow:L / pow:min_interval (spec §5).
+// publisher owns pow:L / pow:min_interval (spec §5).
 func (s *Server) issue(ctx context.Context, sub string) (*buttonv1.IssueChallengeResponse, error) {
 	l, err := s.RDB.Get(ctx, "pow:L").Uint64()
 	if err != nil {

@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// Difficulty controller constants (spec §5): the tick leader keeps the
+// Difficulty controller constants (spec §5): the publisher keeps the
 // accepted-submit rate inside [BandLow, BandHigh] by moving L one step at
 // a time; min_interval is the hard valve, L the cost valve.
 const (
