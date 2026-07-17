@@ -211,7 +211,7 @@ func TestApplyBatch_CommitErrorWrappedAmbiguous(t *testing.T) {
 
 	dctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 	defer cancel()
-	_, err := applyBatch(dctx, pool, uuid.New().String(), "user-ambig-direct", 1, time.Now())
+	_, err := applyBatch(dctx, pool, "user-ambig-direct", 1, time.Now())
 	require.Error(t, err)
 	require.ErrorIs(t, err, errCommitAmbiguous)
 }

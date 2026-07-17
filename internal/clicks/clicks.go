@@ -76,7 +76,7 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 	}
 
 	// Step 3: durable personal truth.
-	res, err := applyBatch(ctx, pool, p.ID, p.Sub, count, now)
+	res, err := applyBatch(ctx, pool, p.Sub, count, now)
 	if err != nil {
 		logger.Warn("batch txn failed", "sub", p.Sub, "err", err)
 		// Pre-commit failures rolled back cleanly — release the burn and the
@@ -110,7 +110,7 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 // clicks twice, and there is no batch-level idempotency key to catch it.
 var errCommitAmbiguous = errors.New("commit outcome ambiguous")
 
-func applyBatch(ctx context.Context, pool *pgxpool.Pool, id, sub string, count uint32, now time.Time) (*Result, error) {
+func applyBatch(ctx context.Context, pool *pgxpool.Pool, sub string, count uint32, now time.Time) (*Result, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, err

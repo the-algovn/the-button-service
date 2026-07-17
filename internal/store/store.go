@@ -1,6 +1,9 @@
 // Package store wires Postgres (durable truth — and since the outbox
 // removal, the ONLY counter truth) and Redis (hot control state: PoW,
-// throttle, difficulty, milestones).
+// throttle, difficulty, milestones). Redis maxmemory-policy MUST be
+// noeviction: the PoW burn keys (pow:<id>) are what prevent challenge
+// replay/double-credit, so evicting one under memory pressure is a
+// correctness bug, not just a cache miss.
 package store
 
 import (
