@@ -48,7 +48,9 @@ type frame struct {
 func TestPublisher_BroadcastsSumOnChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pool, err := store.NewPG(ctx, testutil.StartPostgres(t))
+	pgURL := testutil.StartPostgres(t)
+	testutil.Migrate(t, pgURL)
+	pool, err := store.NewPG(ctx, pgURL)
 	require.NoError(t, err)
 	defer pool.Close()
 	rdb, err := store.NewRedis(ctx, testutil.StartRedis(t))
@@ -89,7 +91,9 @@ func TestPublisher_BroadcastsSumOnChange(t *testing.T) {
 func TestPublisher_WritesDifficultyKeysAtStartup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pool, err := store.NewPG(ctx, testutil.StartPostgres(t))
+	pgURL := testutil.StartPostgres(t)
+	testutil.Migrate(t, pgURL)
+	pool, err := store.NewPG(ctx, pgURL)
 	require.NoError(t, err)
 	defer pool.Close()
 	rdb, err := store.NewRedis(ctx, testutil.StartRedis(t))
@@ -109,7 +113,9 @@ func TestPublisher_WritesDifficultyKeysAtStartup(t *testing.T) {
 func TestMilestone_ExactlyOnceAcrossTwoPublishers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pool, err := store.NewPG(ctx, testutil.StartPostgres(t))
+	pgURL := testutil.StartPostgres(t)
+	testutil.Migrate(t, pgURL)
+	pool, err := store.NewPG(ctx, pgURL)
 	require.NoError(t, err)
 	defer pool.Close()
 	rdb, err := store.NewRedis(ctx, testutil.StartRedis(t))

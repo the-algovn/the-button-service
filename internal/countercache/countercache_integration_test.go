@@ -19,7 +19,9 @@ import (
 func TestCache_WarmupTotalsAndUsers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pool, err := store.NewPG(ctx, testutil.StartPostgres(t))
+	pgURL := testutil.StartPostgres(t)
+	testutil.Migrate(t, pgURL)
+	pool, err := store.NewPG(ctx, pgURL)
 	require.NoError(t, err)
 	defer pool.Close()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
