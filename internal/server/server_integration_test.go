@@ -30,6 +30,7 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	testutil.Migrate(t, pgURL)
 	pool, err := store.NewPG(ctx, pgURL)
 	require.NoError(t, err)
 	defer pool.Close()
