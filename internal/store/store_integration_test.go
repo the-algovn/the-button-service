@@ -161,7 +161,7 @@ func TestMigrate_DownRecreatesCounterOutbox(t *testing.T) {
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'counter_outbox'`).Scan(&before))
 	require.Zero(t, before, "precondition: counter_outbox must be dropped before rollback")
 
-	reversed, err := migrate.Down(ctx, url)
+	reversed, err := migrate.Down(ctx, url, false)
 	require.NoError(t, err)
 	require.Contains(t, reversed, "version=2", "Down must reverse migration 002, the most recently applied")
 
@@ -175,6 +175,56 @@ func TestMigrate_DownRecreatesCounterOutbox(t *testing.T) {
 	var version int64
 	require.NoError(t, pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version`).Scan(&version))
 	require.EqualValues(t, 1, version, "goose_db_version must reflect the reversal of migration 002")
+}
+
+// TestMigrate_DownRefusesToDestroyProductionData proves the guard added
+// after a live rollback nearly dropped every click and achievement in
+// production: once Down has reversed 002 (leaving the database at version
+// 1), a second unforced Down must refuse rather than run 001's Down, which
+// drops user_clicks and user_achievements. Passing force must still allow a
+// deliberate teardown, proving the guard is a guard and not a wall.
+func TestMigrate_DownRefusesToDestroyProductionData(t *testing.T) {
+	url := testutil.StartPostgres(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	testutil.Migrate(t, url) // applies 001+002
+
+	pool, err := NewPG(ctx, url)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "u1", Clicks: 42})
+	require.NoError(t, err)
+
+	// First Down reverses 002 (safe: recreates counter_outbox), leaving the
+	// database at version 1.
+	_, err = migrate.Down(ctx, url, false)
+	require.NoError(t, err)
+	var version int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT max(version_id) FROM goose_db_version`).Scan(&version))
+	require.EqualValues(t, 1, version, "precondition: database must be at version 1 before the second Down")
+
+	// Second unforced Down must refuse: reversing 001 would drop
+	// user_clicks and user_achievements.
+	_, err = migrate.Down(ctx, url, false)
+	require.Error(t, err, "Down must refuse to reverse migration 001 without force")
+	require.Contains(t, err.Error(), "user_clicks")
+	require.Contains(t, err.Error(), "user_achievements")
+
+	var clicks int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT clicks FROM user_clicks WHERE user_sub = 'u1'`).Scan(&clicks))
+	require.EqualValues(t, 42, clicks, "refused Down must not touch click data")
+
+	// The force override proves the guard is a guard, not a wall: it still
+	// allows a deliberate teardown of a throwaway/dev database.
+	_, err = migrate.Down(ctx, url, true)
+	require.NoError(t, err, "forced Down must still reverse migration 001")
+
+	var n int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'user_clicks'`).Scan(&n))
+	require.Zero(t, n, "forced Down must drop user_clicks")
 }
 
 func TestNewRedis_Ping(t *testing.T) {

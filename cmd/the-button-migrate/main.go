@@ -17,6 +17,7 @@ import (
 
 func main() {
 	down := flag.Bool("down", false, "reverse the most recently applied migration instead of applying pending ones")
+	forceDestructive := flag.Bool("force-destructive", false, "with -down, bypass the guard that refuses to reverse migration 001 (DROPS user_clicks and user_achievements); only for a throwaway/dev database")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -32,7 +33,7 @@ func main() {
 	defer stop()
 
 	if *down {
-		reversed, err := migrate.Down(ctx, url)
+		reversed, err := migrate.Down(ctx, url, *forceDestructive)
 		if err != nil {
 			logger.Error("migrate down failed", "err", err)
 			os.Exit(1)

@@ -23,6 +23,13 @@ import (
 // against two runners racing, so the session locker does.
 const lockKey int64 = 7238410394821017561
 
+// minSafeDownVersion is the lowest goose version Down will reverse from
+// without force. Migration 001 creates user_clicks and user_achievements;
+// reversing it (current version <= 1) DROPS both tables — every click and
+// achievement the product has ever recorded. Reversing 002 (current
+// version 2) only recreates counter_outbox and is safe.
+const minSafeDownVersion int64 = 1
+
 // newProvider wires the goose provider shared by Up and Down: the embedded
 // migrations, a pgx *sql.DB, and the advisory-lock session locker. On success
 // the caller owns sqlDB and must close it; on error sqlDB is already closed.
@@ -74,12 +81,28 @@ func Up(ctx context.Context, url string) ([]string, error) {
 // human-readable line describing what was reversed, mirroring Up's line
 // format. There is no way to reverse more than one migration per call — that
 // is goose's contract, not a limitation added here.
-func Down(ctx context.Context, url string) (string, error) {
+//
+// Unless force is true, Down refuses to reverse migration 001 (i.e. when the
+// current version is already <= minSafeDownVersion): 001's Down drops
+// user_clicks and user_achievements, destroying every click and achievement
+// in production. Pass force only for a deliberate teardown of a
+// throwaway/dev database.
+func Down(ctx context.Context, url string, force bool) (string, error) {
 	p, sqlDB, err := newProvider(url)
 	if err != nil {
 		return "", err
 	}
 	defer sqlDB.Close()
+
+	if !force {
+		version, err := p.GetDBVersion(ctx)
+		if err != nil {
+			return "", err
+		}
+		if version <= minSafeDownVersion {
+			return "", fmt.Errorf("refusing to reverse migration 001 (current version=%d): its Down DROPS user_clicks and user_achievements — every click and achievement in production; pass -force-destructive only for a throwaway/dev database", version)
+		}
+	}
 
 	r, err := p.Down(ctx)
 	if err != nil {
