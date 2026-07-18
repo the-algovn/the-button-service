@@ -6,6 +6,8 @@ package db
 
 import (
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type UserAchievement struct {
@@ -17,4 +19,16 @@ type UserAchievement struct {
 type UserClick struct {
 	UserSub string
 	Clicks  int64
+}
+
+type UserProfile struct {
+	UserSub     string
+	DisplayName string
+	UpdatedAt   time.Time
+}
+
+type UserWeeklyClick struct {
+	UserSub   string
+	WeekStart pgtype.Date
+	Clicks    int64
 }

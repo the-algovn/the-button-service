@@ -19,3 +19,21 @@ SELECT COUNT(*) AS count FROM user_clicks;
 
 -- name: GetUserClicks :one
 SELECT clicks FROM user_clicks WHERE user_sub = $1;
+
+-- name: UpsertUserWeeklyClicks :one
+INSERT INTO user_weekly_clicks AS w (user_sub, week_start, clicks) VALUES ($1, $2, $3)
+ON CONFLICT (user_sub, week_start) DO UPDATE SET clicks = w.clicks + $3
+RETURNING clicks;
+
+-- name: UpsertUserProfile :exec
+INSERT INTO user_profile AS p (user_sub, display_name, updated_at) VALUES ($1, $2, now())
+ON CONFLICT (user_sub) DO UPDATE SET display_name = $2, updated_at = now();
+
+-- name: ListAllUserClicks :many
+SELECT user_sub, clicks FROM user_clicks;
+
+-- name: ListWeekUserClicks :many
+SELECT user_sub, clicks FROM user_weekly_clicks WHERE week_start = $1;
+
+-- name: ListProfileNames :many
+SELECT user_sub, display_name FROM user_profile WHERE user_sub = ANY($1::text[]);

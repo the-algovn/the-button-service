@@ -8,6 +8,8 @@ package db
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const countUsers = `-- name: CountUsers :one
@@ -50,6 +52,59 @@ func (q *Queries) InsertUserAchievement(ctx context.Context, arg InsertUserAchie
 	return unlocked_at, err
 }
 
+const listAllUserClicks = `-- name: ListAllUserClicks :many
+SELECT user_sub, clicks FROM user_clicks
+`
+
+func (q *Queries) ListAllUserClicks(ctx context.Context) ([]UserClick, error) {
+	rows, err := q.db.Query(ctx, listAllUserClicks)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UserClick{}
+	for rows.Next() {
+		var i UserClick
+		if err := rows.Scan(&i.UserSub, &i.Clicks); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProfileNames = `-- name: ListProfileNames :many
+SELECT user_sub, display_name FROM user_profile WHERE user_sub = ANY($1::text[])
+`
+
+type ListProfileNamesRow struct {
+	UserSub     string
+	DisplayName string
+}
+
+func (q *Queries) ListProfileNames(ctx context.Context, dollar_1 []string) ([]ListProfileNamesRow, error) {
+	rows, err := q.db.Query(ctx, listProfileNames, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListProfileNamesRow{}
+	for rows.Next() {
+		var i ListProfileNamesRow
+		if err := rows.Scan(&i.UserSub, &i.DisplayName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserAchievements = `-- name: ListUserAchievements :many
 SELECT achievement_id, unlocked_at FROM user_achievements WHERE user_sub = $1
 `
@@ -69,6 +124,35 @@ func (q *Queries) ListUserAchievements(ctx context.Context, userSub string) ([]L
 	for rows.Next() {
 		var i ListUserAchievementsRow
 		if err := rows.Scan(&i.AchievementID, &i.UnlockedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWeekUserClicks = `-- name: ListWeekUserClicks :many
+SELECT user_sub, clicks FROM user_weekly_clicks WHERE week_start = $1
+`
+
+type ListWeekUserClicksRow struct {
+	UserSub string
+	Clicks  int64
+}
+
+func (q *Queries) ListWeekUserClicks(ctx context.Context, weekStart pgtype.Date) ([]ListWeekUserClicksRow, error) {
+	rows, err := q.db.Query(ctx, listWeekUserClicks, weekStart)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWeekUserClicksRow{}
+	for rows.Next() {
+		var i ListWeekUserClicksRow
+		if err := rows.Scan(&i.UserSub, &i.Clicks); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -103,6 +187,40 @@ type UpsertUserClicksParams struct {
 
 func (q *Queries) UpsertUserClicks(ctx context.Context, arg UpsertUserClicksParams) (int64, error) {
 	row := q.db.QueryRow(ctx, upsertUserClicks, arg.UserSub, arg.Clicks)
+	var clicks int64
+	err := row.Scan(&clicks)
+	return clicks, err
+}
+
+const upsertUserProfile = `-- name: UpsertUserProfile :exec
+INSERT INTO user_profile AS p (user_sub, display_name, updated_at) VALUES ($1, $2, now())
+ON CONFLICT (user_sub) DO UPDATE SET display_name = $2, updated_at = now()
+`
+
+type UpsertUserProfileParams struct {
+	UserSub     string
+	DisplayName string
+}
+
+func (q *Queries) UpsertUserProfile(ctx context.Context, arg UpsertUserProfileParams) error {
+	_, err := q.db.Exec(ctx, upsertUserProfile, arg.UserSub, arg.DisplayName)
+	return err
+}
+
+const upsertUserWeeklyClicks = `-- name: UpsertUserWeeklyClicks :one
+INSERT INTO user_weekly_clicks AS w (user_sub, week_start, clicks) VALUES ($1, $2, $3)
+ON CONFLICT (user_sub, week_start) DO UPDATE SET clicks = w.clicks + $3
+RETURNING clicks
+`
+
+type UpsertUserWeeklyClicksParams struct {
+	UserSub   string
+	WeekStart pgtype.Date
+	Clicks    int64
+}
+
+func (q *Queries) UpsertUserWeeklyClicks(ctx context.Context, arg UpsertUserWeeklyClicksParams) (int64, error) {
+	row := q.db.QueryRow(ctx, upsertUserWeeklyClicks, arg.UserSub, arg.WeekStart, arg.Clicks)
 	var clicks int64
 	err := row.Scan(&clicks)
 	return clicks, err
