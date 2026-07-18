@@ -25,6 +25,7 @@ import (
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/clicks"
 	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/difficulty"
 	"github.com/the-algovn/the-button-service/internal/leaderboard"
 	"github.com/the-algovn/the-button-service/internal/pow"
 )
@@ -40,6 +41,7 @@ type Server struct {
 	Pool   *pgxpool.Pool
 	RDB    *redis.Client
 	Tick   Totaler
+	Diff   *difficulty.Cache
 	Logger *slog.Logger
 	W0     uint64
 	Keys   [][]byte // [current] or [current, previous] — rotation window
@@ -118,16 +120,12 @@ func (s *Server) GetCounter(context.Context, *buttonv1.GetCounterRequest) (*butt
 	return &buttonv1.GetCounterResponse{Total: total, TotalUsers: users}, nil
 }
 
-// issue builds a signed challenge for sub from the shared difficulty keys.
-// Fails closed: Redis miss/error → Unavailable — no local defaults, the
+// issue builds a signed challenge for sub from the shared difficulty cache.
+// Fails closed: no cached value yet → Unavailable — no local defaults, the
 // publisher owns pow:L / pow:min_interval (spec §5).
-func (s *Server) issue(ctx context.Context, sub string) (*buttonv1.IssueChallengeResponse, error) {
-	l, err := s.RDB.Get(ctx, "pow:L").Uint64()
-	if err != nil {
-		return nil, status.Error(codes.Unavailable, "difficulty unavailable")
-	}
-	minInterval, err := s.RDB.Get(ctx, "pow:min_interval").Uint64()
-	if err != nil {
+func (s *Server) issue(sub string) (*buttonv1.IssueChallengeResponse, error) {
+	l, minInterval, ok := s.Diff.Get()
+	if !ok {
 		return nil, status.Error(codes.Unavailable, "difficulty unavailable")
 	}
 	id, err := uuid.NewV7()
@@ -163,15 +161,14 @@ func (s *Server) IssueChallenge(ctx context.Context, _ *buttonv1.IssueChallengeR
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
-	return s.issue(ctx, sub)
+	return s.issue(sub)
 }
 
 func (s *Server) SubmitClicks(ctx context.Context, req *buttonv1.SubmitClicksRequest) (*buttonv1.SubmitClicksResponse, error) {
-	sub, err := subFromContext(ctx)
+	sub, displayName, err := identityFromContext(ctx)
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
-	_, displayName, _ := identityFromContext(ctx)
 	p, err := pow.Parse(req.GetChallenge(), s.Keys...)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "bad challenge")
@@ -191,31 +188,17 @@ func (s *Server) SubmitClicks(ctx context.Context, req *buttonv1.SubmitClicksReq
 		return nil, status.Error(codes.InvalidArgument, "bad proof of work")
 	}
 
-	res, err := clicks.Submit(ctx, s.RDB, s.Pool, s.Logger, p, count, now, displayName)
+	res, err := clicks.Submit(ctx, s.RDB, p, count, now, displayName)
 	if err != nil {
 		return nil, err
 	}
-
 	resp := &buttonv1.SubmitClicksResponse{UserTotalClicks: res.UserTotal}
-	for _, u := range res.Unlocked {
-		resp.Unlocked = append(resp.Unlocked, &buttonv1.Achievement{
-			Id:          u.Achievement.ID,
-			Title:       u.Achievement.Title,
-			Description: u.Achievement.Description,
-			UnlockedAt:  timestamppb.New(u.UnlockedAt),
-		})
-	}
-	// piggyback the next challenge; issuance failure must not void the
-	// accepted batch (spec §6 step 5)
-	if next, err := s.issue(ctx, sub); err == nil {
+	// piggyback the next challenge; issuance failure must not void the batch
+	if next, err := s.issue(sub); err == nil {
 		resp.NextChallenge = next
 	} else {
 		s.Logger.Warn("piggyback issue failed", "err", err)
 	}
-
-	atRank, wkRank := leaderboard.SelfRank(ctx, s.RDB, sub, res.UserTotal, res.WeeklyTotal, now)
-	resp.AllTimeRank = atRank
-	resp.WeeklyRank = wkRank
 	return resp, nil
 }
 

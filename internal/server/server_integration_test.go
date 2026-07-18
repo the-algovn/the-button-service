@@ -17,6 +17,7 @@ import (
 
 	buttonv1 "github.com/the-algovn/protos/gen/go/algovn/button/v1"
 	"github.com/the-algovn/the-button-service/internal/countercache"
+	"github.com/the-algovn/the-button-service/internal/difficulty"
 	"github.com/the-algovn/the-button-service/internal/leaderboard"
 	"github.com/the-algovn/the-button-service/internal/pow"
 	"github.com/the-algovn/the-button-service/internal/publisher"
@@ -66,9 +67,11 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 	go pub.Run(ctx)
 	cache := &countercache.Cache{Pool: pool, Logger: logger}
 	go cache.Run(ctx)
+	diff := &difficulty.Cache{RDB: rdb, Logger: logger}
+	go diff.Run(ctx)
 
 	key := []byte("integration-test-key-0123456789a")
-	srv := &Server{Pool: pool, RDB: rdb, Tick: cache, Logger: logger, W0: 4, Keys: [][]byte{key}}
+	srv := &Server{Pool: pool, RDB: rdb, Tick: cache, Diff: diff, Logger: logger, W0: 4, Keys: [][]byte{key}}
 
 	// fails closed until the publisher writes pow:L / pow:min_interval
 	require.Eventually(t, func() bool {
@@ -93,19 +96,23 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 25, sub.UserTotalClicks)
 	require.NotNil(t, sub.NextChallenge, "next challenge must piggyback")
-	require.NotEmpty(t, sub.Unlocked) // mvh + ten at least
 
-	// weekly bucket + profile were written in the same tx as the click
-	var weekly int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT clicks FROM user_weekly_clicks WHERE user_sub=$1 AND week_start=$2`,
-		"user-1", leaderboard.WeekStart(time.Now())).Scan(&weekly))
-	require.Equal(t, int64(25), weekly)
+	// weekly bucket + profile are mirrored to Postgres asynchronously by the
+	// persist worker (started by pub.Run) — poll rather than assert directly.
+	require.Eventually(t, func() bool {
+		var weekly int64
+		err := pool.QueryRow(context.Background(),
+			`SELECT clicks FROM user_weekly_clicks WHERE user_sub=$1 AND week_start=$2`,
+			"user-1", leaderboard.WeekStart(time.Now())).Scan(&weekly)
+		return err == nil && weekly == 25
+	}, 15*time.Second, 200*time.Millisecond)
 
-	var name string
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT display_name FROM user_profile WHERE user_sub=$1`, "user-1").Scan(&name))
-	require.NotEmpty(t, name)
+	require.Eventually(t, func() bool {
+		var name string
+		err := pool.QueryRow(context.Background(),
+			`SELECT display_name FROM user_profile WHERE user_sub=$1`, "user-1").Scan(&name)
+		return err == nil && name != ""
+	}, 15*time.Second, 200*time.Millisecond)
 
 	// bad work is rejected before touching state
 	_, err = srv.SubmitClicks(authCtx("user-1"), &buttonv1.SubmitClicksRequest{
@@ -147,20 +154,24 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 		return err == nil && resp.Total == 25
 	}, 5*time.Second, 200*time.Millisecond)
 
-	// ListAchievements: personalized for user-1, bare for anonymous
-	la, err := srv.ListAchievements(authCtx("user-1"), &buttonv1.ListAchievementsRequest{})
-	require.NoError(t, err)
-	require.Len(t, la.Catalog, 12)
-	var mvhUnlocked bool
-	for _, a := range la.Catalog {
-		if a.Id == "mvh" {
-			mvhUnlocked = a.UnlockedAt != nil
+	// ListAchievements: personalized for user-1, bare for anonymous. Both the
+	// achievement unlock and user_total_clicks land via the async persist
+	// worker, so poll until they show up.
+	var la *buttonv1.ListAchievementsResponse
+	require.Eventually(t, func() bool {
+		var err error
+		la, err = srv.ListAchievements(authCtx("user-1"), &buttonv1.ListAchievementsRequest{})
+		if err != nil || la.UserTotalClicks != 25 {
+			return false
 		}
-	}
-	require.True(t, mvhUnlocked)
-
-	// user_total_clicks is seeded for the personalized caller
-	require.Equal(t, uint64(25), la.UserTotalClicks)
+		for _, a := range la.Catalog {
+			if a.Id == "mvh" && a.UnlockedAt != nil {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 200*time.Millisecond)
+	require.Len(t, la.Catalog, 12)
 
 	// a signed-in user who has never clicked has no row: zero, not an error
 	fresh, err := srv.ListAchievements(authCtx("user-never-clicked"), &buttonv1.ListAchievementsRequest{})
