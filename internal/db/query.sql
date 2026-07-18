@@ -37,3 +37,24 @@ SELECT user_sub, clicks FROM user_weekly_clicks WHERE week_start = $1;
 
 -- name: ListProfileNames :many
 SELECT user_sub, display_name FROM user_profile WHERE user_sub = ANY($1::text[]);
+
+-- name: BatchUpsertUserClicks :exec
+-- Absolute set (not increment): the caller passes the authoritative Redis
+-- ZSET score, so re-running a flush is idempotent.
+INSERT INTO user_clicks AS u (user_sub, clicks)
+SELECT unnest(@subs::text[]), unnest(@clicks::bigint[])
+ON CONFLICT (user_sub) DO UPDATE SET clicks = EXCLUDED.clicks;
+
+-- name: BatchUpsertUserWeeklyClicks :exec
+INSERT INTO user_weekly_clicks AS w (user_sub, week_start, clicks)
+SELECT unnest(@subs::text[]), @week_start::date, unnest(@clicks::bigint[])
+ON CONFLICT (user_sub, week_start) DO UPDATE SET clicks = EXCLUDED.clicks;
+
+-- name: BatchUpsertUserProfile :exec
+INSERT INTO user_profile AS p (user_sub, display_name, updated_at)
+SELECT unnest(@subs::text[]), unnest(@names::text[]), now()
+ON CONFLICT (user_sub) DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = now();
+
+-- name: InsertUserAchievementAt :exec
+INSERT INTO user_achievements (user_sub, achievement_id, unlocked_at) VALUES ($1, $2, $3)
+ON CONFLICT DO NOTHING;

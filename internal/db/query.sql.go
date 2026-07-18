@@ -12,6 +12,57 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const batchUpsertUserClicks = `-- name: BatchUpsertUserClicks :exec
+INSERT INTO user_clicks AS u (user_sub, clicks)
+SELECT unnest($1::text[]), unnest($2::bigint[])
+ON CONFLICT (user_sub) DO UPDATE SET clicks = EXCLUDED.clicks
+`
+
+type BatchUpsertUserClicksParams struct {
+	Subs   []string
+	Clicks []int64
+}
+
+// Absolute set (not increment): the caller passes the authoritative Redis
+// ZSET score, so re-running a flush is idempotent.
+func (q *Queries) BatchUpsertUserClicks(ctx context.Context, arg BatchUpsertUserClicksParams) error {
+	_, err := q.db.Exec(ctx, batchUpsertUserClicks, arg.Subs, arg.Clicks)
+	return err
+}
+
+const batchUpsertUserProfile = `-- name: BatchUpsertUserProfile :exec
+INSERT INTO user_profile AS p (user_sub, display_name, updated_at)
+SELECT unnest($1::text[]), unnest($2::text[]), now()
+ON CONFLICT (user_sub) DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = now()
+`
+
+type BatchUpsertUserProfileParams struct {
+	Subs  []string
+	Names []string
+}
+
+func (q *Queries) BatchUpsertUserProfile(ctx context.Context, arg BatchUpsertUserProfileParams) error {
+	_, err := q.db.Exec(ctx, batchUpsertUserProfile, arg.Subs, arg.Names)
+	return err
+}
+
+const batchUpsertUserWeeklyClicks = `-- name: BatchUpsertUserWeeklyClicks :exec
+INSERT INTO user_weekly_clicks AS w (user_sub, week_start, clicks)
+SELECT unnest($1::text[]), $2::date, unnest($3::bigint[])
+ON CONFLICT (user_sub, week_start) DO UPDATE SET clicks = EXCLUDED.clicks
+`
+
+type BatchUpsertUserWeeklyClicksParams struct {
+	Subs      []string
+	WeekStart pgtype.Date
+	Clicks    []int64
+}
+
+func (q *Queries) BatchUpsertUserWeeklyClicks(ctx context.Context, arg BatchUpsertUserWeeklyClicksParams) error {
+	_, err := q.db.Exec(ctx, batchUpsertUserWeeklyClicks, arg.Subs, arg.WeekStart, arg.Clicks)
+	return err
+}
+
 const countUsers = `-- name: CountUsers :one
 SELECT COUNT(*) AS count FROM user_clicks
 `
@@ -50,6 +101,22 @@ func (q *Queries) InsertUserAchievement(ctx context.Context, arg InsertUserAchie
 	var unlocked_at time.Time
 	err := row.Scan(&unlocked_at)
 	return unlocked_at, err
+}
+
+const insertUserAchievementAt = `-- name: InsertUserAchievementAt :exec
+INSERT INTO user_achievements (user_sub, achievement_id, unlocked_at) VALUES ($1, $2, $3)
+ON CONFLICT DO NOTHING
+`
+
+type InsertUserAchievementAtParams struct {
+	UserSub       string
+	AchievementID string
+	UnlockedAt    time.Time
+}
+
+func (q *Queries) InsertUserAchievementAt(ctx context.Context, arg InsertUserAchievementAtParams) error {
+	_, err := q.db.Exec(ctx, insertUserAchievementAt, arg.UserSub, arg.AchievementID, arg.UnlockedAt)
+	return err
 }
 
 const listAllUserClicks = `-- name: ListAllUserClicks :many
