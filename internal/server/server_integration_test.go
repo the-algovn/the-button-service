@@ -195,4 +195,15 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 			return false
 		}
 	}, 10*time.Second, 200*time.Millisecond)
+
+	// GetLeaderboard: anonymous sees the board; personalized sees own ranks
+	lb, err := srv.GetLeaderboard(context.Background(), &buttonv1.GetLeaderboardRequest{})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(lb.AllTime), 1)
+	require.Equal(t, uint64(25), lb.AllTime[0].Clicks)
+	require.Zero(t, lb.MyAllTimeRank) // anonymous -> no personal rank
+
+	me, err := srv.GetLeaderboard(authCtx("user-1"), &buttonv1.GetLeaderboardRequest{})
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), me.MyAllTimeRank)
 }

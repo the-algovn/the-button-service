@@ -23,6 +23,12 @@ func SelfRank(ctx context.Context, rdb redis.Cmdable, sub string, allTime, weekl
 	return revRank(ctx, rdb, AllTimeKey, sub), revRank(ctx, rdb, weekKey, sub)
 }
 
+// Rank returns sub's 1-based rank in key without mutating anything, or 0 if
+// unranked. Used by the read-only GetLeaderboard path (which must not ZADD).
+func Rank(ctx context.Context, rdb redis.Cmdable, key, sub string) uint32 {
+	return revRank(ctx, rdb, key, sub)
+}
+
 func revRank(ctx context.Context, rdb redis.Cmdable, key, sub string) uint32 {
 	r, err := rdb.ZRevRank(ctx, key, sub).Result()
 	if err != nil {

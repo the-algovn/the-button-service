@@ -277,3 +277,43 @@ func (s *Server) ListAchievements(ctx context.Context, _ *buttonv1.ListAchieveme
 	}
 	return resp, nil
 }
+
+func (s *Server) GetLeaderboard(ctx context.Context, _ *buttonv1.GetLeaderboardRequest) (*buttonv1.GetLeaderboardResponse, error) {
+	now := time.Now()
+	weekKey := leaderboard.WeekKey(now)
+	resp := &buttonv1.GetLeaderboardResponse{
+		AllTime:  s.renderBoard(ctx, leaderboard.AllTimeKey),
+		ThisWeek: s.renderBoard(ctx, weekKey),
+	}
+	if sub, err := subFromContext(ctx); err == nil {
+		resp.MyAllTimeRank = leaderboard.Rank(ctx, s.RDB, leaderboard.AllTimeKey, sub)
+		resp.MyWeeklyRank = leaderboard.Rank(ctx, s.RDB, weekKey, sub)
+	}
+	return resp, nil
+}
+
+func (s *Server) renderBoard(ctx context.Context, key string) []*buttonv1.LeaderboardEntry {
+	top, err := leaderboard.TopN(ctx, s.RDB, key, 20)
+	if err != nil || len(top) == 0 {
+		return nil
+	}
+	subs := make([]string, len(top))
+	for i, r := range top {
+		subs[i] = r.Sub
+	}
+	names := map[string]string{}
+	if rows, err := db.New(s.Pool).ListProfileNames(ctx, subs); err == nil {
+		for _, r := range rows {
+			names[r.UserSub] = r.DisplayName
+		}
+	}
+	out := make([]*buttonv1.LeaderboardEntry, len(top))
+	for i, r := range top {
+		name := names[r.Sub]
+		if name == "" {
+			name = "clicker-" + r.Sub[:min(6, len(r.Sub))]
+		}
+		out[i] = &buttonv1.LeaderboardEntry{Rank: uint32(i + 1), DisplayName: name, Clicks: r.Clicks}
+	}
+	return out
+}
