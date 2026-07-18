@@ -87,21 +87,6 @@ func crosses(total uint64, batch uint32, x uint64) bool {
 	return old < x && x <= total
 }
 
-// Reached returns every threshold achievement whose bar total has passed,
-// regardless of when. The persist worker uses it as a flush-time backstop:
-// SETNX + ON CONFLICT dedupe, so re-proposing already-claimed thresholds is
-// harmless and any threshold missed by a dropped stream event is recovered.
-func Reached(total uint64) []Achievement {
-	var out []Achievement
-	for _, th := range thresholds {
-		if total >= th.x {
-			a, _ := ByID(th.id)
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
 // Evaluate returns every achievement earned by a batch that brought the
 // user to total at now. Threshold rules use crosses semantics so already-
 // earned rows are never re-proposed; batch/time rules rely on the

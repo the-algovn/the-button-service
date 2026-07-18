@@ -67,7 +67,7 @@ func TestPersister_FlushesAndAwardsFromStream(t *testing.T) {
 	require.Equal(t, "Xavier", name)
 }
 
-func TestPersister_ReconcileAwardsThresholdBackstop(t *testing.T) {
+func TestPersister_ReconcileHealsCounterMonotonically(t *testing.T) {
 	ctx := context.Background()
 	pgURL := testutil.StartPostgres(t)
 	testutil.Migrate(t, pgURL)
@@ -78,18 +78,47 @@ func TestPersister_ReconcileAwardsThresholdBackstop(t *testing.T) {
 	require.NoError(t, err)
 	defer rdb.Close()
 
-	// a user with a durable ZSET score but NO stream event (a dropped event)
-	require.NoError(t, rdb.ZAdd(ctx, leaderboard.AllTimeKey, redis.Z{Score: 100, Member: "backstop-user"}).Err())
-
+	require.NoError(t, rdb.ZAdd(ctx, leaderboard.AllTimeKey,
+		redis.Z{Score: 70, Member: "u1"}, redis.Z{Score: 30, Member: "u2"}).Err())
 	p := &Persister{Pool: pool, RDB: rdb, Logger: logger}
-	p.reconcile(ctx)
 
-	rows, err := db.New(pool).ListUserAchievements(ctx, "backstop-user")
-	require.NoError(t, err)
-	got := map[string]bool{}
-	for _, r := range rows {
-		got[r.AchievementID] = true
-	}
-	require.True(t, got["mvh"] && got["ten"] && got["century"], "reconcile must backstop threshold achievements")
+	// counter:total is low (disaster) -> heal UP to the ZSET sum (100)
+	require.NoError(t, rdb.Set(ctx, "counter:total", 40, 0).Err())
+	p.reconcile(ctx)
 	require.Equal(t, "100", rdb.Get(ctx, "counter:total").Val())
+
+	// counter:total already >= sum -> reconcile must NOT lower it (monotonic)
+	require.NoError(t, rdb.Set(ctx, "counter:total", 150, 0).Err())
+	p.reconcile(ctx)
+	require.Equal(t, "150", rdb.Get(ctx, "counter:total").Val(), "reconcile must never move the counter backward")
+}
+
+func TestPersister_AchievementClaimRolledBackOnInsertFailure(t *testing.T) {
+	ctx := context.Background()
+	pgURL := testutil.StartPostgres(t)
+	testutil.Migrate(t, pgURL)
+	pool, err := store.NewPG(ctx, pgURL)
+	require.NoError(t, err)
+	defer pool.Close()
+	rdb, err := store.NewRedis(ctx, testutil.StartRedis(t))
+	require.NoError(t, err)
+	defer rdb.Close()
+	p := &Persister{Pool: pool, RDB: rdb, Logger: logger}
+
+	// break the insert target so InsertUserAchievementAt fails
+	_, err = pool.Exec(ctx, `ALTER TABLE user_achievements RENAME TO user_achievements_broken`)
+	require.NoError(t, err)
+
+	m := redis.XMessage{ID: "1-0", Values: map[string]any{
+		"sub": "u1", "count": "1", "total": "1", "ts": "1752800000"}}
+	require.False(t, p.process(ctx, m), "process must return false so the event redelivers")
+	require.EqualValues(t, 0, rdb.Exists(ctx, "ach:u1:mvh").Val(), "the claim must be rolled back, not left set")
+
+	// heal the table; reprocessing now persists the achievement
+	_, err = pool.Exec(ctx, `ALTER TABLE user_achievements_broken RENAME TO user_achievements`)
+	require.NoError(t, err)
+	require.True(t, p.process(ctx, m))
+	rows, err := db.New(pool).ListUserAchievements(ctx, "u1")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
 }

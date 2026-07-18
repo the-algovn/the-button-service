@@ -147,6 +147,7 @@ func (p *Persister) process(ctx context.Context, m redis.XMessage) bool {
 		if err := q.InsertUserAchievementAt(ctx, db.InsertUserAchievementAtParams{
 			UserSub: sub, AchievementID: a.ID, UnlockedAt: at,
 		}); err != nil {
+			p.RDB.Del(ctx, key) // roll back the claim so redelivery re-attempts the insert
 			p.Logger.Warn("ach insert", "err", err)
 			return false // Postgres down — redeliver later
 		}
@@ -245,9 +246,19 @@ func (p *Persister) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// reconcile is the ~60s backstop: it re-awards any threshold achievement a
-// dropped stream event would have missed (idempotent via SETNX + ON CONFLICT)
-// and corrects counter:total against the lb:alltime score sum.
+// counterHealScript raises counter:total toward the ZSET-sum truth but NEVER
+// lowers it — the atomic hot-path script keeps the two equal in steady state,
+// so this only ever recovers a counter left low by a Redis-loss disaster.
+var counterHealScript = redis.NewScript(`
+local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
+local sum = tonumber(ARGV[1])
+if sum > cur then redis.call('SET', KEYS[1], sum) end
+return 1
+`)
+
+// reconcile is the ~60s backstop: it monotonically heals counter:total against
+// the lb:alltime score sum (only ever raising it), recovering drift from a
+// partial AOF/disaster recovery without ever moving the public counter backward.
 func (p *Persister) reconcile(ctx context.Context) {
 	cctx, cancel := context.WithTimeout(ctx, persistCallTimeout)
 	defer cancel()
@@ -258,28 +269,15 @@ func (p *Persister) reconcile(ctx context.Context) {
 		}
 		return
 	}
-	q := db.New(p.Pool)
-	now := time.Now()
 	var sum int64
 	for _, z := range zs {
 		sum += int64(z.Score)
-		member, _ := z.Member.(string)
-		if member == "" {
-			continue
-		}
-		for _, a := range achievements.Reached(uint64(z.Score)) {
-			won, err := p.RDB.SetNX(cctx, "ach:"+member+":"+a.ID, now.Unix(), 0).Result()
-			if err != nil || !won {
-				continue
-			}
-			if err := q.InsertUserAchievementAt(cctx, db.InsertUserAchievementAtParams{
-				UserSub: member, AchievementID: a.ID, UnlockedAt: now,
-			}); err != nil {
-				p.Logger.Warn("reconcile ach insert", "err", err)
-			}
+	}
+	if err := counterHealScript.Run(cctx, p.RDB, []string{"counter:total"}, sum).Err(); err != nil {
+		if ctx.Err() == nil {
+			p.Logger.Warn("reconcile: counter heal", "err", err)
 		}
 	}
-	p.RDB.Set(cctx, "counter:total", sum, 0)
 }
 
 func str(v any) string {
