@@ -19,6 +19,7 @@ import (
 	buttonv1 "github.com/the-algovn/protos/gen/go/algovn/button/v1"
 	"github.com/the-algovn/the-button-service/internal/config"
 	"github.com/the-algovn/the-button-service/internal/countercache"
+	"github.com/the-algovn/the-button-service/internal/difficulty"
 	"github.com/the-algovn/the-button-service/internal/server"
 	"github.com/the-algovn/the-button-service/internal/store"
 )
@@ -53,12 +54,15 @@ func main() {
 	cache := &countercache.Cache{RDB: rdb, Logger: logger}
 	go cache.Run(ctx)
 
+	diff := &difficulty.Cache{RDB: rdb, Logger: logger}
+	go diff.Run(ctx)
+
 	keys := [][]byte{cfg.PowSecret}
 	if cfg.PowSecretPrev != nil {
 		keys = append(keys, cfg.PowSecretPrev)
 	}
 	srv := &server.Server{
-		Pool: pool, RDB: rdb, Tick: cache, Logger: logger,
+		Pool: pool, RDB: rdb, Tick: cache, Diff: diff, Logger: logger,
 		W0: cfg.PowW0, Keys: keys,
 	}
 

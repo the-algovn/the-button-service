@@ -27,6 +27,21 @@ func NewPG(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	return pgxpool.NewWithConfig(ctx, cfg)
 }
 
+// NewPGFlush is the publisher's pool for the async write-behind flush. Same
+// as NewPG but with synchronous_commit=off: the durable mirror may lag Redis
+// by a commit or two, which the design's ~1-2s loss budget already accepts,
+// in exchange for far higher batched-write throughput.
+func NewPGFlush(ctx context.Context, url string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("parse PG_URL: %w", err)
+	}
+	cfg.MaxConns = 10
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "2000"
+	cfg.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
+	return pgxpool.NewWithConfig(ctx, cfg)
+}
+
 // NewRedis parses REDIS_URL and verifies connectivity with a PING.
 func NewRedis(ctx context.Context, url string) (*redis.Client, error) {
 	opt, err := redis.ParseURL(url)

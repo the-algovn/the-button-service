@@ -32,7 +32,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := store.NewPG(ctx, cfg.PGURL)
+	pool, err := store.NewPGFlush(ctx, cfg.PGURL)
 	if err != nil {
 		logger.Error("postgres", "err", err)
 		os.Exit(1)
