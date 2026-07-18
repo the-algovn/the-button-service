@@ -25,6 +25,7 @@ import (
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/clicks"
 	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/leaderboard"
 	"github.com/the-algovn/the-button-service/internal/pow"
 )
 
@@ -207,6 +208,10 @@ func (s *Server) SubmitClicks(ctx context.Context, req *buttonv1.SubmitClicksReq
 	} else {
 		s.Logger.Warn("piggyback issue failed", "err", err)
 	}
+
+	atRank, wkRank := leaderboard.SelfRank(ctx, s.RDB, sub, res.UserTotal, res.WeeklyTotal, now)
+	resp.AllTimeRank = atRank
+	resp.WeeklyRank = wkRank
 	return resp, nil
 }
 
