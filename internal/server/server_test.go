@@ -45,3 +45,25 @@ func TestSubFromContext_Rejects(t *testing.T) {
 	_, err = subFromContext(ctx)
 	require.Error(t, err)
 }
+
+func TestIdentityFromContext(t *testing.T) {
+	// name claim wins
+	sub, name, err := identityFromContext(authCtx("zitadel-user-42"))
+	require.NoError(t, err)
+	require.Equal(t, "zitadel-user-42", sub)
+	require.Equal(t, "zitadel-user-42-name", name) // authCtx sets name = sub+"-name"
+
+	// no name/preferred_username -> clicker-<sub6>
+	payload, _ := json.Marshal(map[string]string{"sub": "abcdef123456"})
+	tok := "h." + base64.RawURLEncoding.EncodeToString(payload) + ".s"
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("authorization", "Bearer "+tok))
+	sub, name, err = identityFromContext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "abcdef123456", sub)
+	require.Equal(t, "clicker-abcdef", name)
+
+	// no auth metadata -> error
+	_, _, err = identityFromContext(context.Background())
+	require.Error(t, err)
+}

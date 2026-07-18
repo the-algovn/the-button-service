@@ -71,39 +71,42 @@ func subFromContext(ctx context.Context) (string, error) {
 	return claims.Sub, nil
 }
 
-// displayNameFromContext derives a server-verified display name from the
-// forwarded token: name -> preferred_username -> clicker-<sub6>. The SPA never
-// supplies this. Returns "" only when there is no valid sub.
-func displayNameFromContext(ctx context.Context) string {
+// identityFromContext does the single read-only segment-2 decode of the
+// forwarded, gateway-verified JWT and returns the subject plus a
+// server-derived display name (name -> preferred_username -> clicker-<sub6>).
+// The SPA never supplies the name. This replaces separate sub/displayName
+// decodes on the submit path.
+func identityFromContext(ctx context.Context) (sub, displayName string, err error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	vals := md.Get("authorization")
 	if len(vals) == 0 {
-		return ""
+		return "", "", errors.New("no authorization metadata")
 	}
 	parts := strings.Split(strings.TrimPrefix(vals[0], "Bearer "), ".")
 	if len(parts) != 3 {
-		return ""
+		return "", "", errors.New("not a JWT")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return ""
+		return "", "", errors.New("bad JWT payload")
 	}
 	var c struct {
 		Sub               string `json:"sub"`
 		Name              string `json:"name"`
 		PreferredUsername string `json:"preferred_username"`
 	}
-	if json.Unmarshal(payload, &c) != nil || c.Sub == "" {
-		return ""
+	if err := json.Unmarshal(payload, &c); err != nil || c.Sub == "" {
+		return "", "", errors.New("bad claims")
 	}
 	switch {
 	case c.Name != "":
-		return c.Name
+		displayName = c.Name
 	case c.PreferredUsername != "":
-		return c.PreferredUsername
+		displayName = c.PreferredUsername
 	default:
-		return "clicker-" + c.Sub[:min(6, len(c.Sub))]
+		displayName = "clicker-" + c.Sub[:min(6, len(c.Sub))]
 	}
+	return c.Sub, displayName, nil
 }
 
 func (s *Server) GetCounter(context.Context, *buttonv1.GetCounterRequest) (*buttonv1.GetCounterResponse, error) {
@@ -168,6 +171,7 @@ func (s *Server) SubmitClicks(ctx context.Context, req *buttonv1.SubmitClicksReq
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
+	_, displayName, _ := identityFromContext(ctx)
 	p, err := pow.Parse(req.GetChallenge(), s.Keys...)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "bad challenge")
@@ -187,7 +191,7 @@ func (s *Server) SubmitClicks(ctx context.Context, req *buttonv1.SubmitClicksReq
 		return nil, status.Error(codes.InvalidArgument, "bad proof of work")
 	}
 
-	res, err := clicks.Submit(ctx, s.RDB, s.Pool, s.Logger, p, count, now, displayNameFromContext(ctx))
+	res, err := clicks.Submit(ctx, s.RDB, s.Pool, s.Logger, p, count, now, displayName)
 	if err != nil {
 		return nil, err
 	}
