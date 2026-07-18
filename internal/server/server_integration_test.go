@@ -65,7 +65,7 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 
 	pub := &publisher.Publisher{Pool: pool, RDB: rdb, Publish: publish, Logger: logger}
 	go pub.Run(ctx)
-	cache := &countercache.Cache{Pool: pool, Logger: logger}
+	cache := &countercache.Cache{RDB: rdb, Logger: logger}
 	go cache.Run(ctx)
 	diff := &difficulty.Cache{RDB: rdb, Logger: logger}
 	go diff.Run(ctx)

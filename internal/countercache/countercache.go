@@ -1,18 +1,19 @@
 // Package countercache keeps a per-replica cache of the public counter and
-// distinct-contributor count, polled straight from Postgres — the only
+// distinct-contributor count, polled straight from Redis — the only
 // counter truth since the outbox removal (see the 2026-07-17 api-publisher
 // split spec). It satisfies server.Totaler.
 package countercache
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
-	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/leaderboard"
 )
 
 const (
@@ -22,7 +23,7 @@ const (
 )
 
 type Cache struct {
-	Pool   *pgxpool.Pool
+	RDB    *redis.Client
 	Logger *slog.Logger
 
 	total     atomic.Uint64
@@ -61,14 +62,16 @@ func (c *Cache) totalLoop(ctx context.Context) {
 func (c *Cache) refreshTotal(ctx context.Context) {
 	cctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	sum, err := db.New(c.Pool).SumUserClicks(cctx)
-	if err != nil {
+	v, err := c.RDB.Get(cctx, "counter:total").Uint64()
+	if errors.Is(err, redis.Nil) {
+		v = 0
+	} else if err != nil {
 		if ctx.Err() == nil {
 			c.Logger.Warn("counter cache refresh failed", "err", err)
 		}
 		return
 	}
-	c.total.Store(uint64(sum))
+	c.total.Store(v)
 	c.haveTotal.Store(true)
 }
 
@@ -88,7 +91,7 @@ func (c *Cache) usersLoop(ctx context.Context) {
 func (c *Cache) refreshUsers(ctx context.Context) {
 	cctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	n, err := db.New(c.Pool).CountUsers(cctx)
+	n, err := c.RDB.ZCard(cctx, leaderboard.AllTimeKey).Result()
 	if err != nil {
 		if ctx.Err() == nil {
 			c.Logger.Warn("user count refresh failed", "err", err)

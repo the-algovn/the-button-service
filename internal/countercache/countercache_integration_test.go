@@ -9,52 +9,34 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
-	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/leaderboard"
 	"github.com/the-algovn/the-button-service/internal/store"
 	"github.com/the-algovn/the-button-service/internal/testutil"
 )
 
-func TestCache_WarmupTotalsAndUsers(t *testing.T) {
+func TestCache_ReadsRedisTotalAndUsers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pgURL := testutil.StartPostgres(t)
-	testutil.Migrate(t, pgURL)
-	pool, err := store.NewPG(ctx, pgURL)
+	rdb, err := store.NewRedis(ctx, testutil.StartRedis(t))
 	require.NoError(t, err)
-	defer pool.Close()
+	defer rdb.Close()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "u1", Clicks: 3})
-	require.NoError(t, err)
-	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "u2", Clicks: 4})
-	require.NoError(t, err)
+	require.NoError(t, rdb.Set(ctx, "counter:total", 7, 0).Err())
+	require.NoError(t, rdb.ZAdd(ctx, leaderboard.AllTimeKey,
+		redis.Z{Score: 3, Member: "u1"}, redis.Z{Score: 4, Member: "u2"}).Err())
 
-	c := &Cache{Pool: pool, Logger: logger}
-
-	// not warmed before Run
+	c := &Cache{RDB: rdb, Logger: logger}
 	_, ok := c.Total()
 	require.False(t, ok)
-	_, ok = c.Users()
-	require.False(t, ok)
-
 	go c.Run(ctx)
 
-	require.Eventually(t, func() bool {
-		total, ok := c.Total()
-		return ok && total == 7
-	}, 10*time.Second, 100*time.Millisecond)
-	require.Eventually(t, func() bool {
-		users, ok := c.Users()
-		return ok && users == 2
-	}, 10*time.Second, 100*time.Millisecond)
+	require.Eventually(t, func() bool { v, ok := c.Total(); return ok && v == 7 }, 10*time.Second, 100*time.Millisecond)
+	require.Eventually(t, func() bool { v, ok := c.Users(); return ok && v == 2 }, 10*time.Second, 100*time.Millisecond)
 
-	// a later write is picked up by the 1s poll
-	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "u1", Clicks: 5})
-	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		total, _ := c.Total()
-		return total == 12
-	}, 10*time.Second, 100*time.Millisecond)
+	require.NoError(t, rdb.IncrBy(ctx, "counter:total", 5).Err())
+	require.Eventually(t, func() bool { v, _ := c.Total(); return v == 12 }, 10*time.Second, 100*time.Millisecond)
 }

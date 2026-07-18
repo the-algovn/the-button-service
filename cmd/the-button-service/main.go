@@ -50,7 +50,7 @@ func main() {
 	}
 	defer rdb.Close()
 
-	cache := &countercache.Cache{Pool: pool, Logger: logger}
+	cache := &countercache.Cache{RDB: rdb, Logger: logger}
 	go cache.Run(ctx)
 
 	keys := [][]byte{cfg.PowSecret}
