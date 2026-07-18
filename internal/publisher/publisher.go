@@ -48,8 +48,59 @@ type Publisher struct {
 
 // Run starts the users loop and the poll loop and blocks until ctx is done.
 func (p *Publisher) Run(ctx context.Context) {
+	p.warmUp(ctx)
+	go (&Persister{Pool: p.Pool, RDB: p.RDB, Logger: p.Logger}).Run(ctx)
 	go p.usersLoop(ctx)
 	p.pollLoop(ctx)
+}
+
+// warmUp restores Redis counter truth from Postgres when counter:total is
+// absent (fresh Redis / disaster recovery). Steady state is a no-op.
+func (p *Publisher) warmUp(ctx context.Context) {
+	if n, err := p.RDB.Exists(ctx, "counter:total").Result(); err == nil && n == 1 {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	q := db.New(p.Pool)
+	all, err := q.ListAllUserClicks(cctx)
+	if err != nil {
+		p.Logger.Warn("warmup: list all clicks", "err", err)
+		return
+	}
+	var sum int64
+	if len(all) > 0 {
+		zs := make([]redis.Z, len(all))
+		for i, r := range all {
+			zs[i] = redis.Z{Score: float64(r.Clicks), Member: r.UserSub}
+			sum += r.Clicks
+		}
+		p.RDB.ZAddArgs(cctx, leaderboard.AllTimeKey, redis.ZAddArgs{GT: true, Members: zs})
+	}
+	now := time.Now()
+	week, err := q.ListWeekUserClicks(cctx, pgDate(leaderboard.WeekStart(now)))
+	if err == nil && len(week) > 0 {
+		zs := make([]redis.Z, len(week))
+		for i, r := range week {
+			zs[i] = redis.Z{Score: float64(r.Clicks), Member: r.UserSub}
+		}
+		p.RDB.ZAddArgs(cctx, leaderboard.WeekKey(now), redis.ZAddArgs{GT: true, Members: zs})
+		p.RDB.Expire(cctx, leaderboard.WeekKey(now), leaderboard.WeekTTL)
+	}
+	if len(all) > 0 {
+		subs := make([]string, len(all))
+		for i, r := range all {
+			subs[i] = r.UserSub
+		}
+		if names, err := q.ListProfileNames(cctx, subs); err == nil && len(names) > 0 {
+			pairs := make([]any, 0, len(names)*2)
+			for _, n := range names {
+				pairs = append(pairs, n.UserSub, n.DisplayName)
+			}
+			p.RDB.HSet(cctx, "profile:names", pairs...)
+		}
+	}
+	p.RDB.SetNX(cctx, "counter:total", sum, 0) // SetNX: never clobber a live counter
 }
 
 func (p *Publisher) pollLoop(ctx context.Context) {
@@ -121,37 +172,21 @@ func (p *Publisher) pollLoop(ctx context.Context) {
 func (p *Publisher) readTotal(ctx context.Context) (uint64, error) {
 	cctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	sum, err := db.New(p.Pool).SumUserClicks(cctx)
-	if err != nil {
-		return 0, err
+	v, err := p.RDB.Get(cctx, "counter:total").Uint64()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
 	}
-	return uint64(sum), nil
+	return v, err
 }
 
 func (p *Publisher) broadcastLeaderboard(ctx context.Context) {
 	cctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	q := db.New(p.Pool)
 	now := time.Now()
-	weekKey := leaderboard.WeekKey(now)
-
-	// refresh both zsets from Postgres truth
-	allRows, err := q.ListAllUserClicks(cctx)
-	if err != nil {
-		p.Logger.Warn("leaderboard all-time read failed", "err", err)
-		return
-	}
-	weekRows, err := q.ListWeekUserClicks(cctx, pgDate(leaderboard.WeekStart(now)))
-	if err != nil {
-		p.Logger.Warn("leaderboard week read failed", "err", err)
-		return
-	}
-	leaderboard.Sync(cctx, p.RDB, toScoreRows(allRows), toWeekScoreRows(weekRows), weekKey)
-
 	frame := map[string]any{
 		"type":     "leaderboard",
 		"allTime":  p.renderTop(cctx, leaderboard.AllTimeKey),
-		"thisWeek": p.renderTop(cctx, weekKey),
+		"thisWeek": p.renderTop(cctx, leaderboard.WeekKey(now)),
 	}
 	p.publishJSON(leaderboardChannel, frame)
 }
@@ -166,9 +201,11 @@ func (p *Publisher) renderTop(ctx context.Context, key string) []map[string]any 
 		subs[i] = r.Sub
 	}
 	names := map[string]string{}
-	if rows, err := db.New(p.Pool).ListProfileNames(ctx, subs); err == nil {
-		for _, r := range rows {
-			names[r.UserSub] = r.DisplayName
+	if vals, err := p.RDB.HMGet(ctx, "profile:names", subs...).Result(); err == nil {
+		for i, v := range vals {
+			if s, ok := v.(string); ok {
+				names[subs[i]] = s
+			}
 		}
 	}
 	out := make([]map[string]any, len(top))
@@ -256,21 +293,3 @@ func (p *Publisher) publishJSON(channel string, v any) {
 }
 
 func pgDate(t time.Time) pgtype.Date { return pgtype.Date{Time: t, Valid: true} }
-
-// NOTE: ListAllUserClicks selects exactly the two columns of user_clicks, so
-// sqlc reuses the existing db.UserClick model (NOT a ListAllUserClicksRow).
-func toScoreRows(rows []db.UserClick) []leaderboard.ScoreRow {
-	out := make([]leaderboard.ScoreRow, len(rows))
-	for i, r := range rows {
-		out[i] = leaderboard.ScoreRow{Sub: r.UserSub, Clicks: uint64(r.Clicks)}
-	}
-	return out
-}
-
-func toWeekScoreRows(rows []db.ListWeekUserClicksRow) []leaderboard.ScoreRow {
-	out := make([]leaderboard.ScoreRow, len(rows))
-	for i, r := range rows {
-		out[i] = leaderboard.ScoreRow{Sub: r.UserSub, Clicks: uint64(r.Clicks)}
-	}
-	return out
-}

@@ -11,10 +11,12 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/leaderboard"
 	"github.com/the-algovn/the-button-service/internal/store"
 	"github.com/the-algovn/the-button-service/internal/testutil"
 )
@@ -45,7 +47,7 @@ type frame struct {
 	Threshold uint64 `json:"threshold"`
 }
 
-func TestPublisher_BroadcastsSumOnChange(t *testing.T) {
+func TestPublisher_BroadcastsCounterOnChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pgURL := testutil.StartPostgres(t)
@@ -59,6 +61,7 @@ func TestPublisher_BroadcastsSumOnChange(t *testing.T) {
 	amqpURL := testutil.StartRabbit(t)
 	msgs := counterQueue(t, amqpURL)
 
+	// warm-up seeds counter:total from Postgres on a cold Redis
 	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "u1", Clicks: 41})
 	require.NoError(t, err)
 
@@ -83,9 +86,33 @@ func TestPublisher_BroadcastsSumOnChange(t *testing.T) {
 	}
 	waitCounter(41)
 
-	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "u2", Clicks: 1})
-	require.NoError(t, err)
+	// a click advances counter:total in Redis (what the hot-path script does)
+	require.NoError(t, rdb.IncrBy(ctx, "counter:total", 1).Err())
 	waitCounter(42)
+}
+
+func TestPublisher_WarmUpDoesNotLowerLiveScore(t *testing.T) {
+	ctx := context.Background()
+	pgURL := testutil.StartPostgres(t)
+	testutil.Migrate(t, pgURL)
+	pool, err := store.NewPG(ctx, pgURL)
+	require.NoError(t, err)
+	defer pool.Close()
+	rdb, err := store.NewRedis(ctx, testutil.StartRedis(t))
+	require.NoError(t, err)
+	defer rdb.Close()
+
+	// durable Postgres value is STALE (41); a live hot-path ZSET score is higher (50).
+	_, err = db.New(pool).UpsertUserClicks(ctx, db.UpsertUserClicksParams{UserSub: "u1", Clicks: 41})
+	require.NoError(t, err)
+	require.NoError(t, rdb.ZAdd(ctx, leaderboard.AllTimeKey, redis.Z{Score: 50, Member: "u1"}).Err())
+	// counter:total absent so warmUp runs.
+
+	p := &Publisher{Pool: pool, RDB: rdb, Publish: func(string, []byte) {}, Logger: logger}
+	p.warmUp(ctx)
+
+	// GT: warmUp must NOT lower the live score to 41.
+	require.EqualValues(t, 50, int(rdb.ZScore(ctx, leaderboard.AllTimeKey, "u1").Val()))
 }
 
 func TestPublisher_WritesDifficultyKeysAtStartup(t *testing.T) {
