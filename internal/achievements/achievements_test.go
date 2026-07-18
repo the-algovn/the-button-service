@@ -54,6 +54,18 @@ func TestEvaluate_FreshWhale(t *testing.T) {
 		ids(Evaluate(10_000, 10_000, neutral)))
 }
 
+func TestReached(t *testing.T) {
+	ids := func(as []Achievement) []string {
+		out := make([]string, len(as))
+		for i, a := range as {
+			out[i] = a.ID
+		}
+		return out
+	}
+	require.ElementsMatch(t, []string{"mvh", "ten", "nice"}, ids(Reached(70)))
+	require.Empty(t, Reached(0))
+}
+
 func TestCatalogAndMilestones(t *testing.T) {
 	require.Len(t, Catalog, 12)
 	for _, a := range Catalog {
