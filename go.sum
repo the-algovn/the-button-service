@@ -160,6 +160,8 @@ github.com/the-algovn/protos/gen/go v0.3.0 h1:bnThokb1Y/c4s5JWj7jBSsJ94SysBKrnP3
 github.com/the-algovn/protos/gen/go v0.3.0/go.mod h1:R7XPFZZ4rZTL4uTugvszHktcYV+MTpGSh2lFal4ZyK0=
 github.com/the-algovn/protos/gen/go v0.4.0 h1:nulha6oHk1OgbNUvc94cGxxXuEqBL2q4ybbyubPzHQ4=
 github.com/the-algovn/protos/gen/go v0.4.0/go.mod h1:R7XPFZZ4rZTL4uTugvszHktcYV+MTpGSh2lFal4ZyK0=
+github.com/the-algovn/protos/gen/go v0.5.0 h1:W2XUC3kEofU/2Y1iEpJyT2lUwAoaLlbkC660+TEcy+A=
+github.com/the-algovn/protos/gen/go v0.5.0/go.mod h1:R7XPFZZ4rZTL4uTugvszHktcYV+MTpGSh2lFal4ZyK0=
 github.com/tklauser/go-sysconf v0.3.16 h1:frioLaCQSsF5Cy1jgRBrzr6t502KIIwQ0MArYICU0nA=
 github.com/tklauser/go-sysconf v0.3.16/go.mod h1:/qNL9xxDhc7tx3HSRsLWNnuzbVfh3e7gh/BmM179nYI=
 github.com/tklauser/numcpus v0.11.0 h1:nSTwhKH5e1dMNsCdVBukSZrURJRoHbSEQjdEbY+9RXw=
