@@ -17,6 +17,7 @@ import (
 
 	buttonv1 "github.com/the-algovn/protos/gen/go/algovn/button/v1"
 	"github.com/the-algovn/the-button-service/internal/countercache"
+	"github.com/the-algovn/the-button-service/internal/leaderboard"
 	"github.com/the-algovn/the-button-service/internal/pow"
 	"github.com/the-algovn/the-button-service/internal/publisher"
 	"github.com/the-algovn/the-button-service/internal/store"
@@ -88,6 +89,18 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 	require.EqualValues(t, 25, sub.UserTotalClicks)
 	require.NotNil(t, sub.NextChallenge, "next challenge must piggyback")
 	require.NotEmpty(t, sub.Unlocked) // mvh + ten at least
+
+	// weekly bucket + profile were written in the same tx as the click
+	var weekly int64
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT clicks FROM user_weekly_clicks WHERE user_sub=$1 AND week_start=$2`,
+		"user-1", leaderboard.WeekStart(time.Now())).Scan(&weekly))
+	require.Equal(t, int64(25), weekly)
+
+	var name string
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT display_name FROM user_profile WHERE user_sub=$1`, "user-1").Scan(&name))
+	require.NotEmpty(t, name)
 
 	// bad work is rejected before touching state
 	_, err = srv.SubmitClicks(authCtx("user-1"), &buttonv1.SubmitClicksRequest{

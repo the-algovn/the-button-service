@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/leaderboard"
 	"github.com/the-algovn/the-button-service/internal/pow"
 )
 
@@ -35,8 +37,9 @@ type Unlock struct {
 
 // Result is the outcome of an accepted batch.
 type Result struct {
-	UserTotal uint64
-	Unlocked  []Unlock
+	UserTotal   uint64
+	WeeklyTotal uint64
+	Unlocked    []Unlock
 }
 
 // Submit executes spec §6 steps 2-4 for an already-verified challenge
@@ -44,7 +47,7 @@ type Result struct {
 //   - AlreadyExists     — challenge replay (burn key present)
 //   - ResourceExhausted — per-user min-interval hit (token un-burned, stays valid)
 //   - Unavailable       — Redis or Postgres unreachable (clicks fail closed)
-func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.Logger, p pow.Payload, count uint32, now time.Time) (*Result, error) {
+func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.Logger, p pow.Payload, count uint32, now time.Time, displayName string) (*Result, error) {
 	powKey := "pow:" + p.ID
 	throttleKey := "throttle:" + p.Sub
 	bg := context.WithoutCancel(ctx) // compensation must survive deadline expiry
@@ -76,7 +79,7 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 	}
 
 	// Step 3: durable personal truth.
-	res, err := applyBatch(ctx, pool, p.Sub, count, now)
+	res, err := applyBatch(ctx, pool, p.Sub, count, now, displayName)
 	if err != nil {
 		logger.Warn("batch txn failed", "sub", p.Sub, "err", err)
 		// Pre-commit failures rolled back cleanly — release the burn and the
@@ -110,7 +113,7 @@ func Submit(ctx context.Context, rdb Rediser, pool *pgxpool.Pool, logger *slog.L
 // clicks twice, and there is no batch-level idempotency key to catch it.
 var errCommitAmbiguous = errors.New("commit outcome ambiguous")
 
-func applyBatch(ctx context.Context, pool *pgxpool.Pool, sub string, count uint32, now time.Time) (*Result, error) {
+func applyBatch(ctx context.Context, pool *pgxpool.Pool, sub string, count uint32, now time.Time, displayName string) (*Result, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -123,7 +126,21 @@ func applyBatch(ctx context.Context, pool *pgxpool.Pool, sub string, count uint3
 		return nil, err
 	}
 
-	res := &Result{UserTotal: uint64(total)}
+	weekStart := pgtype.Date{Time: leaderboard.WeekStart(now), Valid: true}
+	weekly, err := q.UpsertUserWeeklyClicks(ctx, db.UpsertUserWeeklyClicksParams{
+		UserSub: sub, WeekStart: weekStart, Clicks: int64(count),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if displayName != "" {
+		if err := q.UpsertUserProfile(ctx, db.UpsertUserProfileParams{UserSub: sub, DisplayName: displayName}); err != nil {
+			return nil, err
+		}
+	}
+
+	res := &Result{UserTotal: uint64(total), WeeklyTotal: uint64(weekly)}
 	for _, a := range achievements.Evaluate(uint64(total), count, now) {
 		at, err := q.InsertUserAchievement(ctx, db.InsertUserAchievementParams{UserSub: sub, AchievementID: a.ID})
 		if errors.Is(err, pgx.ErrNoRows) {

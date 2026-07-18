@@ -13,7 +13,7 @@ import (
 // authCtx forges the forwarded (gateway-verified) JWT: only segment 2 is
 // read by the trust-model decode. Shared with the integration tests.
 func authCtx(sub string) context.Context {
-	payload, _ := json.Marshal(map[string]string{"sub": sub})
+	payload, _ := json.Marshal(map[string]string{"sub": sub, "name": sub + "-name"})
 	tok := "h." + base64.RawURLEncoding.EncodeToString(payload) + ".s"
 	return metadata.NewIncomingContext(context.Background(),
 		metadata.Pairs("authorization", "Bearer "+tok))

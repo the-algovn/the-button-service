@@ -70,6 +70,41 @@ func subFromContext(ctx context.Context) (string, error) {
 	return claims.Sub, nil
 }
 
+// displayNameFromContext derives a server-verified display name from the
+// forwarded token: name -> preferred_username -> clicker-<sub6>. The SPA never
+// supplies this. Returns "" only when there is no valid sub.
+func displayNameFromContext(ctx context.Context) string {
+	md, _ := metadata.FromIncomingContext(ctx)
+	vals := md.Get("authorization")
+	if len(vals) == 0 {
+		return ""
+	}
+	parts := strings.Split(strings.TrimPrefix(vals[0], "Bearer "), ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var c struct {
+		Sub               string `json:"sub"`
+		Name              string `json:"name"`
+		PreferredUsername string `json:"preferred_username"`
+	}
+	if json.Unmarshal(payload, &c) != nil || c.Sub == "" {
+		return ""
+	}
+	switch {
+	case c.Name != "":
+		return c.Name
+	case c.PreferredUsername != "":
+		return c.PreferredUsername
+	default:
+		return "clicker-" + c.Sub[:min(6, len(c.Sub))]
+	}
+}
+
 func (s *Server) GetCounter(context.Context, *buttonv1.GetCounterRequest) (*buttonv1.GetCounterResponse, error) {
 	total, ok := s.Tick.Total()
 	if !ok {
@@ -151,7 +186,7 @@ func (s *Server) SubmitClicks(ctx context.Context, req *buttonv1.SubmitClicksReq
 		return nil, status.Error(codes.InvalidArgument, "bad proof of work")
 	}
 
-	res, err := clicks.Submit(ctx, s.RDB, s.Pool, s.Logger, p, count, now)
+	res, err := clicks.Submit(ctx, s.RDB, s.Pool, s.Logger, p, count, now, displayNameFromContext(ctx))
 	if err != nil {
 		return nil, err
 	}
