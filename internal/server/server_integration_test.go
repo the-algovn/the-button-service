@@ -52,6 +52,11 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 	require.NoError(t, ch.QueueBind(q.Name, "the-button.counter", "events", false, nil))
 	msgs, err := ch.Consume(q.Name, "", true, true, false, false, nil)
 	require.NoError(t, err)
+	lbQ, err := ch.QueueDeclare("", false, true, true, false, nil)
+	require.NoError(t, err)
+	require.NoError(t, ch.QueueBind(lbQ.Name, "the-button.leaderboard", "events", false, nil))
+	lbMsgs, err := ch.Consume(lbQ.Name, "", true, true, false, false, nil)
+	require.NoError(t, err)
 	publish := func(channel string, body []byte) {
 		_ = ch.PublishWithContext(ctx, "events", channel, false, false,
 			amqp.Publishing{ContentType: "application/json", Body: body})
@@ -170,4 +175,24 @@ func TestEndToEnd_SubmitTickPublishCounter(t *testing.T) {
 	}
 	require.Empty(t, anon.Milestones)     // total 25 — nothing reached
 	require.Zero(t, anon.UserTotalClicks) // never personalized without a token
+
+	// a leaderboard frame lands within a few publisher cycles and ranks user-1
+	require.Eventually(t, func() bool {
+		select {
+		case m := <-lbMsgs:
+			var f struct {
+				Type    string `json:"type"`
+				AllTime []struct {
+					Name   string `json:"name"`
+					Clicks uint64 `json:"clicks"`
+				} `json:"allTime"`
+			}
+			if json.Unmarshal(m.Body, &f) != nil || f.Type != "leaderboard" {
+				return false
+			}
+			return len(f.AllTime) >= 1 && f.AllTime[0].Clicks == 25
+		default:
+			return false
+		}
+	}, 10*time.Second, 200*time.Millisecond)
 }

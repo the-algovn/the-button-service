@@ -17,19 +17,23 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/the-algovn/the-button-service/internal/achievements"
 	"github.com/the-algovn/the-button-service/internal/db"
+	"github.com/the-algovn/the-button-service/internal/leaderboard"
 	"github.com/the-algovn/the-button-service/internal/pow"
 )
 
 const (
-	pollInterval   = time.Second
-	usersInterval  = 15 * time.Second
-	callTimeout    = 3 * time.Second
-	counterChannel = "the-button.counter"
+	pollInterval       = time.Second
+	usersInterval      = 15 * time.Second
+	callTimeout        = 3 * time.Second
+	counterChannel     = "the-button.counter"
+	leaderboardEveryN  = 3
+	leaderboardChannel = "the-button.leaderboard"
 )
 
 type Publisher struct {
@@ -62,6 +66,7 @@ func (p *Publisher) pollLoop(ctx context.Context) {
 	// that reconnected during a publisher restart) sees the current total
 	// without waiting for a click.
 	var lastPublished int64 = -1
+	var pollN int
 
 	tick := time.NewTicker(pollInterval)
 	defer tick.Stop()
@@ -79,6 +84,7 @@ func (p *Publisher) pollLoop(ctx context.Context) {
 			}
 			continue
 		}
+		pollN++
 		// Freshness signal: set on every successful poll, changed or not,
 		// so an idle counter is never mistaken for a frozen loop.
 		lastPollUnixtime.Set(float64(time.Now().Unix()))
@@ -91,6 +97,10 @@ func (p *Publisher) pollLoop(ctx context.Context) {
 			p.publishJSON(counterChannel, frame)
 			p.claimMilestones(ctx, total)
 			lastPublished = int64(total)
+		}
+
+		if pollN%leaderboardEveryN == 0 {
+			p.broadcastLeaderboard(ctx)
 		}
 
 		// controller: EWMA of accepted submits/s → NextL → shared keys
@@ -116,6 +126,60 @@ func (p *Publisher) readTotal(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	return uint64(sum), nil
+}
+
+func (p *Publisher) broadcastLeaderboard(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	q := db.New(p.Pool)
+	now := time.Now()
+	weekKey := leaderboard.WeekKey(now)
+
+	// refresh both zsets from Postgres truth
+	allRows, err := q.ListAllUserClicks(cctx)
+	if err != nil {
+		p.Logger.Warn("leaderboard all-time read failed", "err", err)
+		return
+	}
+	weekRows, err := q.ListWeekUserClicks(cctx, pgDate(leaderboard.WeekStart(now)))
+	if err != nil {
+		p.Logger.Warn("leaderboard week read failed", "err", err)
+		return
+	}
+	leaderboard.Sync(cctx, p.RDB, toScoreRows(allRows), toWeekScoreRows(weekRows), weekKey)
+
+	frame := map[string]any{
+		"type":     "leaderboard",
+		"allTime":  p.renderTop(cctx, leaderboard.AllTimeKey),
+		"thisWeek": p.renderTop(cctx, weekKey),
+	}
+	p.publishJSON(leaderboardChannel, frame)
+}
+
+func (p *Publisher) renderTop(ctx context.Context, key string) []map[string]any {
+	top, err := leaderboard.TopN(ctx, p.RDB, key, 20)
+	if err != nil || len(top) == 0 {
+		return []map[string]any{}
+	}
+	subs := make([]string, len(top))
+	for i, r := range top {
+		subs[i] = r.Sub
+	}
+	names := map[string]string{}
+	if rows, err := db.New(p.Pool).ListProfileNames(ctx, subs); err == nil {
+		for _, r := range rows {
+			names[r.UserSub] = r.DisplayName
+		}
+	}
+	out := make([]map[string]any, len(top))
+	for i, r := range top {
+		name := names[r.Sub]
+		if name == "" {
+			name = "clicker-" + r.Sub[:min(6, len(r.Sub))]
+		}
+		out[i] = map[string]any{"rank": i + 1, "name": name, "clicks": r.Clicks}
+	}
+	return out
 }
 
 // claimMilestones SETNX-claims every reached threshold and publishes only a
@@ -189,4 +253,24 @@ func (p *Publisher) publishJSON(channel string, v any) {
 	}
 	body, _ := json.Marshal(v)
 	p.Publish(channel, body)
+}
+
+func pgDate(t time.Time) pgtype.Date { return pgtype.Date{Time: t, Valid: true} }
+
+// NOTE: ListAllUserClicks selects exactly the two columns of user_clicks, so
+// sqlc reuses the existing db.UserClick model (NOT a ListAllUserClicksRow).
+func toScoreRows(rows []db.UserClick) []leaderboard.ScoreRow {
+	out := make([]leaderboard.ScoreRow, len(rows))
+	for i, r := range rows {
+		out[i] = leaderboard.ScoreRow{Sub: r.UserSub, Clicks: uint64(r.Clicks)}
+	}
+	return out
+}
+
+func toWeekScoreRows(rows []db.ListWeekUserClicksRow) []leaderboard.ScoreRow {
+	out := make([]leaderboard.ScoreRow, len(rows))
+	for i, r := range rows {
+		out[i] = leaderboard.ScoreRow{Sub: r.UserSub, Clicks: uint64(r.Clicks)}
+	}
+	return out
 }
