@@ -16,9 +16,8 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
-	buttonv1 "github.com/the-algovn/protos/gen/go/algovn/button/v1"
+	buttonv2 "github.com/the-algovn/protos/gen/go/algovn/button/v2"
 	"github.com/the-algovn/the-button-service/internal/config"
-	"github.com/the-algovn/the-button-service/internal/countercache"
 	"github.com/the-algovn/the-button-service/internal/difficulty"
 	"github.com/the-algovn/the-button-service/internal/kafka"
 	"github.com/the-algovn/the-button-service/internal/server"
@@ -38,13 +37,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := store.NewPG(ctx, cfg.PGURL)
-	if err != nil {
-		logger.Error("postgres", "err", err)
-		os.Exit(1)
-	}
-	defer pool.Close()
-
 	rdb, err := store.NewRedis(ctx, cfg.RedisURL)
 	if err != nil {
 		logger.Error("redis", "err", err)
@@ -59,9 +51,6 @@ func main() {
 	}
 	defer prod.Close()
 
-	cache := &countercache.Cache{RDB: rdb, Logger: logger}
-	go cache.Run(ctx)
-
 	diff := &difficulty.Cache{RDB: rdb, Logger: logger}
 	go diff.Run(ctx)
 
@@ -70,7 +59,7 @@ func main() {
 		keys = append(keys, cfg.PowSecretPrev)
 	}
 	srv := &server.Server{
-		Pool: pool, RDB: rdb, Prod: prod, Tick: cache, Diff: diff, Logger: logger,
+		RDB: rdb, Prod: prod, Diff: diff, Logger: logger,
 		W0: cfg.PowW0, Keys: keys,
 	}
 
@@ -80,7 +69,7 @@ func main() {
 		os.Exit(1)
 	}
 	gs := grpc.NewServer()
-	buttonv1.RegisterButtonServiceServer(gs, srv)
+	buttonv2.RegisterButtonServiceServer(gs, srv)
 	healthpb.RegisterHealthServer(gs, health.NewServer())
 	reflection.Register(gs)
 
