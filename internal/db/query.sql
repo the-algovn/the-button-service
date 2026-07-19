@@ -58,3 +58,31 @@ ON CONFLICT (user_sub) DO UPDATE SET display_name = EXCLUDED.display_name, updat
 -- name: InsertUserAchievementAt :exec
 INSERT INTO user_achievements (user_sub, achievement_id, unlocked_at) VALUES ($1, $2, $3)
 ON CONFLICT DO NOTHING;
+
+-- name: UpsertCounterState :exec
+INSERT INTO counter_state (id, total) VALUES (1, $1)
+ON CONFLICT (id) DO UPDATE SET total = EXCLUDED.total;
+
+-- name: GetCounterState :one
+SELECT total FROM counter_state WHERE id = 1;
+
+-- name: ListAllProfiles :many
+SELECT user_sub, display_name FROM user_profile;
+
+-- name: ListAllUserAchievements :many
+SELECT user_sub, achievement_id, unlocked_at FROM user_achievements;
+
+-- name: BatchUpsertUserAchievements :exec
+-- First-write-wins on unlock time: re-snapshotting never rewrites unlocked_at.
+INSERT INTO user_achievements (user_sub, achievement_id, unlocked_at)
+SELECT unnest(@subs::text[]), unnest(@ids::text[]), unnest(@unlocked_ats::timestamptz[])
+ON CONFLICT DO NOTHING;
+
+-- name: BatchUpsertUserStreak :exec
+INSERT INTO user_streak (user_sub, cur_days, best_days, last_day)
+SELECT unnest(@subs::text[]), unnest(@cur_days::int[]), unnest(@best_days::int[]), unnest(@last_days::text[])
+ON CONFLICT (user_sub) DO UPDATE SET
+  cur_days = EXCLUDED.cur_days, best_days = EXCLUDED.best_days, last_day = EXCLUDED.last_day;
+
+-- name: ListAllUserStreak :many
+SELECT user_sub, cur_days, best_days, last_day FROM user_streak;

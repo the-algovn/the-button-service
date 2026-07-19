@@ -12,6 +12,24 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const batchUpsertUserAchievements = `-- name: BatchUpsertUserAchievements :exec
+INSERT INTO user_achievements (user_sub, achievement_id, unlocked_at)
+SELECT unnest($1::text[]), unnest($2::text[]), unnest($3::timestamptz[])
+ON CONFLICT DO NOTHING
+`
+
+type BatchUpsertUserAchievementsParams struct {
+	Subs        []string
+	Ids         []string
+	UnlockedAts []time.Time
+}
+
+// First-write-wins on unlock time: re-snapshotting never rewrites unlocked_at.
+func (q *Queries) BatchUpsertUserAchievements(ctx context.Context, arg BatchUpsertUserAchievementsParams) error {
+	_, err := q.db.Exec(ctx, batchUpsertUserAchievements, arg.Subs, arg.Ids, arg.UnlockedAts)
+	return err
+}
+
 const batchUpsertUserClicks = `-- name: BatchUpsertUserClicks :exec
 INSERT INTO user_clicks AS u (user_sub, clicks)
 SELECT unnest($1::text[]), unnest($2::bigint[])
@@ -46,6 +64,30 @@ func (q *Queries) BatchUpsertUserProfile(ctx context.Context, arg BatchUpsertUse
 	return err
 }
 
+const batchUpsertUserStreak = `-- name: BatchUpsertUserStreak :exec
+INSERT INTO user_streak (user_sub, cur_days, best_days, last_day)
+SELECT unnest($1::text[]), unnest($2::int[]), unnest($3::int[]), unnest($4::text[])
+ON CONFLICT (user_sub) DO UPDATE SET
+  cur_days = EXCLUDED.cur_days, best_days = EXCLUDED.best_days, last_day = EXCLUDED.last_day
+`
+
+type BatchUpsertUserStreakParams struct {
+	Subs     []string
+	CurDays  []int32
+	BestDays []int32
+	LastDays []string
+}
+
+func (q *Queries) BatchUpsertUserStreak(ctx context.Context, arg BatchUpsertUserStreakParams) error {
+	_, err := q.db.Exec(ctx, batchUpsertUserStreak,
+		arg.Subs,
+		arg.CurDays,
+		arg.BestDays,
+		arg.LastDays,
+	)
+	return err
+}
+
 const batchUpsertUserWeeklyClicks = `-- name: BatchUpsertUserWeeklyClicks :exec
 INSERT INTO user_weekly_clicks AS w (user_sub, week_start, clicks)
 SELECT unnest($1::text[]), $2::date, unnest($3::bigint[])
@@ -72,6 +114,17 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const getCounterState = `-- name: GetCounterState :one
+SELECT total FROM counter_state WHERE id = 1
+`
+
+func (q *Queries) GetCounterState(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, getCounterState)
+	var total int64
+	err := row.Scan(&total)
+	return total, err
 }
 
 const getUserClicks = `-- name: GetUserClicks :one
@@ -119,6 +172,59 @@ func (q *Queries) InsertUserAchievementAt(ctx context.Context, arg InsertUserAch
 	return err
 }
 
+const listAllProfiles = `-- name: ListAllProfiles :many
+SELECT user_sub, display_name FROM user_profile
+`
+
+type ListAllProfilesRow struct {
+	UserSub     string
+	DisplayName string
+}
+
+func (q *Queries) ListAllProfiles(ctx context.Context) ([]ListAllProfilesRow, error) {
+	rows, err := q.db.Query(ctx, listAllProfiles)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllProfilesRow{}
+	for rows.Next() {
+		var i ListAllProfilesRow
+		if err := rows.Scan(&i.UserSub, &i.DisplayName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAllUserAchievements = `-- name: ListAllUserAchievements :many
+SELECT user_sub, achievement_id, unlocked_at FROM user_achievements
+`
+
+func (q *Queries) ListAllUserAchievements(ctx context.Context) ([]UserAchievement, error) {
+	rows, err := q.db.Query(ctx, listAllUserAchievements)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UserAchievement{}
+	for rows.Next() {
+		var i UserAchievement
+		if err := rows.Scan(&i.UserSub, &i.AchievementID, &i.UnlockedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAllUserClicks = `-- name: ListAllUserClicks :many
 SELECT user_sub, clicks FROM user_clicks
 `
@@ -133,6 +239,35 @@ func (q *Queries) ListAllUserClicks(ctx context.Context) ([]UserClick, error) {
 	for rows.Next() {
 		var i UserClick
 		if err := rows.Scan(&i.UserSub, &i.Clicks); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAllUserStreak = `-- name: ListAllUserStreak :many
+SELECT user_sub, cur_days, best_days, last_day FROM user_streak
+`
+
+func (q *Queries) ListAllUserStreak(ctx context.Context) ([]UserStreak, error) {
+	rows, err := q.db.Query(ctx, listAllUserStreak)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UserStreak{}
+	for rows.Next() {
+		var i UserStreak
+		if err := rows.Scan(
+			&i.UserSub,
+			&i.CurDays,
+			&i.BestDays,
+			&i.LastDay,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -239,6 +374,16 @@ func (q *Queries) SumUserClicks(ctx context.Context) (int64, error) {
 	var total int64
 	err := row.Scan(&total)
 	return total, err
+}
+
+const upsertCounterState = `-- name: UpsertCounterState :exec
+INSERT INTO counter_state (id, total) VALUES (1, $1)
+ON CONFLICT (id) DO UPDATE SET total = EXCLUDED.total
+`
+
+func (q *Queries) UpsertCounterState(ctx context.Context, total int64) error {
+	_, err := q.db.Exec(ctx, upsertCounterState, total)
+	return err
 }
 
 const upsertUserClicks = `-- name: UpsertUserClicks :one

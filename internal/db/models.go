@@ -10,6 +10,11 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type CounterState struct {
+	ID    int32
+	Total int64
+}
+
 type UserAchievement struct {
 	UserSub       string
 	AchievementID string
@@ -25,6 +30,13 @@ type UserProfile struct {
 	UserSub     string
 	DisplayName string
 	UpdatedAt   time.Time
+}
+
+type UserStreak struct {
+	UserSub  string
+	CurDays  int32
+	BestDays int32
+	LastDay  string
 }
 
 type UserWeeklyClick struct {
