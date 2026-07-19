@@ -5,6 +5,7 @@ package kafka
 
 import (
 	"context"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -14,6 +15,7 @@ func NewProducer(brokers []string) (*kgo.Client, error) {
 		kgo.SeedBrokers(brokers...),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.ProducerBatchMaxBytes(1<<20),
+		kgo.RecordDeliveryTimeout(10*time.Second),
 	)
 }
 

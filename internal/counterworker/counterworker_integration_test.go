@@ -28,7 +28,10 @@ func TestCounterWorker_IdempotentIncr(t *testing.T) {
 	prod, err := kafka.NewProducer(brokers)
 	require.NoError(t, err)
 	defer prod.Close()
-	_, err = kadm.NewClient(prod).CreateTopic(ctx, 1, 1, nil, kafka.TopicClicks)
+	adm := kadm.NewClient(prod)
+	_, err = adm.CreateTopic(ctx, 1, 1, nil, kafka.TopicClicks)
+	require.NoError(t, err)
+	_, err = adm.CreateTopic(ctx, 1, 1, nil, kafka.TopicSSECounter)
 	require.NoError(t, err)
 
 	// ch-1 is delivered twice (a duplicate); ch-2 once.
