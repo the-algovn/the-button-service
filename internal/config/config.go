@@ -6,16 +6,18 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
-	PGURL         string // PG_URL (required)
-	RedisURL      string // REDIS_URL (required)
-	PowSecret     []byte // POW_SECRET (required, std-base64 of 32 raw bytes)
-	PowSecretPrev []byte // POW_SECRET_PREV (optional, rotation window)
-	PowW0         uint64 // POW_W0 (default 16384 = 2^14 expected hashes/click)
-	ListenAddr    string // LISTEN_ADDR (default :9090)
-	MetricsAddr   string // METRICS_ADDR (default :9091)
+	PGURL         string   // PG_URL (required)
+	RedisURL      string   // REDIS_URL (required)
+	KafkaBrokers  []string // KAFKA_BROKERS (required, comma-separated)
+	PowSecret     []byte   // POW_SECRET (required, std-base64 of 32 raw bytes)
+	PowSecretPrev []byte   // POW_SECRET_PREV (optional, rotation window)
+	PowW0         uint64   // POW_W0 (default 16384 = 2^14 expected hashes/click)
+	ListenAddr    string   // LISTEN_ADDR (default :9090)
+	MetricsAddr   string   // METRICS_ADDR (default :9091)
 }
 
 func Load() (*Config, error) {
@@ -30,6 +32,13 @@ func Load() (*Config, error) {
 	}
 	if c.RedisURL == "" {
 		return nil, fmt.Errorf("REDIS_URL is required")
+	}
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+	if kafkaBrokers == "" {
+		return nil, fmt.Errorf("KAFKA_BROKERS is required")
+	}
+	for _, b := range strings.Split(kafkaBrokers, ",") {
+		c.KafkaBrokers = append(c.KafkaBrokers, strings.TrimSpace(b))
 	}
 	secret := os.Getenv("POW_SECRET")
 	if secret == "" {

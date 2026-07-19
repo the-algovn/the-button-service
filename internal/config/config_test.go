@@ -12,6 +12,15 @@ func setRequired(t *testing.T) {
 	t.Setenv("PG_URL", "postgres://u:p@localhost:5432/the_button")
 	t.Setenv("REDIS_URL", "redis://:pw@localhost:6379/0")
 	t.Setenv("POW_SECRET", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	t.Setenv("KAFKA_BROKERS", "localhost:9092")
+}
+
+func TestLoad_KafkaBrokers(t *testing.T) {
+	setRequired(t)
+	t.Setenv("KAFKA_BROKERS", "a:9092,b:9092")
+	c, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, []string{"a:9092", "b:9092"}, c.KafkaBrokers)
 }
 
 func TestLoad_DefaultsAndDecoding(t *testing.T) {
@@ -26,7 +35,7 @@ func TestLoad_DefaultsAndDecoding(t *testing.T) {
 }
 
 func TestLoad_MissingRequired(t *testing.T) {
-	for _, missing := range []string{"PG_URL", "REDIS_URL", "POW_SECRET"} {
+	for _, missing := range []string{"PG_URL", "REDIS_URL", "POW_SECRET", "KAFKA_BROKERS"} {
 		t.Run(missing, func(t *testing.T) {
 			setRequired(t)
 			t.Setenv(missing, "")
