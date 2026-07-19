@@ -77,20 +77,19 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-// PublisherConfig is the publisher binary's environment. No PoW secret: the
-// difficulty controller only writes pow:L, it never signs tokens.
-type PublisherConfig struct {
-	PGURL       string // PG_URL (required)
-	RedisURL    string // REDIS_URL (required)
-	AMQPURL     string // AMQP_URL (required — publishing is this binary's whole job)
-	MetricsAddr string // METRICS_ADDR (default :9091)
+// WorkerConfig is the worker binary's environment: the two Kafka consumer groups
+// and the snapshot loop. No PoW secret — the worker never signs challenges.
+type WorkerConfig struct {
+	PGURL        string   // PG_URL (required)
+	RedisURL     string   // REDIS_URL (required)
+	KafkaBrokers []string // KAFKA_BROKERS (required, comma-separated)
+	MetricsAddr  string   // METRICS_ADDR (default :9091)
 }
 
-func LoadPublisher() (*PublisherConfig, error) {
-	c := &PublisherConfig{
+func LoadWorker() (*WorkerConfig, error) {
+	c := &WorkerConfig{
 		PGURL:       os.Getenv("PG_URL"),
 		RedisURL:    os.Getenv("REDIS_URL"),
-		AMQPURL:     os.Getenv("AMQP_URL"),
 		MetricsAddr: env("METRICS_ADDR", ":9091"),
 	}
 	if c.PGURL == "" {
@@ -99,8 +98,12 @@ func LoadPublisher() (*PublisherConfig, error) {
 	if c.RedisURL == "" {
 		return nil, fmt.Errorf("REDIS_URL is required")
 	}
-	if c.AMQPURL == "" {
-		return nil, fmt.Errorf("AMQP_URL is required")
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+	if kafkaBrokers == "" {
+		return nil, fmt.Errorf("KAFKA_BROKERS is required")
+	}
+	for _, b := range strings.Split(kafkaBrokers, ",") {
+		c.KafkaBrokers = append(c.KafkaBrokers, strings.TrimSpace(b))
 	}
 	return c, nil
 }

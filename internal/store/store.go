@@ -27,10 +27,10 @@ func NewPG(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	return pgxpool.NewWithConfig(ctx, cfg)
 }
 
-// NewPGFlush is the publisher's pool for the async write-behind flush. Same
-// as NewPG but with synchronous_commit=off: the durable mirror may lag Redis
-// by a commit or two, which the design's ~1-2s loss budget already accepts,
-// in exchange for far higher batched-write throughput.
+// NewPGFlush is the worker's pool for the periodic snapshot dump. Same as NewPG
+// but with synchronous_commit=off: the durable snapshot may lag Redis by a commit
+// or two — the design's ~1-2s loss budget accepts that in exchange for far higher
+// batched-write throughput. Redis stays authoritative.
 func NewPGFlush(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {

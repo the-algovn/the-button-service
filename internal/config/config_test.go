@@ -76,21 +76,22 @@ func TestLoad_ShortSecretPrev(t *testing.T) {
 	require.ErrorContains(t, err, "POW_SECRET_PREV")
 }
 
-func TestLoadPublisher_RequiredAndDefaults(t *testing.T) {
+func TestLoadWorker_RequiredAndDefaults(t *testing.T) {
 	t.Setenv("PG_URL", "postgres://u:p@localhost:5432/the_button")
 	t.Setenv("REDIS_URL", "redis://:pw@localhost:6379/0")
-	t.Setenv("AMQP_URL", "amqp://u:p@localhost:5672/")
-	c, err := LoadPublisher()
+	t.Setenv("KAFKA_BROKERS", "b1:9092, b2:9092")
+	c, err := LoadWorker()
 	require.NoError(t, err)
 	require.Equal(t, ":9091", c.MetricsAddr)
+	require.Equal(t, []string{"b1:9092", "b2:9092"}, c.KafkaBrokers)
 
-	for _, missing := range []string{"PG_URL", "REDIS_URL", "AMQP_URL"} {
+	for _, missing := range []string{"PG_URL", "REDIS_URL", "KAFKA_BROKERS"} {
 		t.Run(missing, func(t *testing.T) {
 			t.Setenv("PG_URL", "x")
 			t.Setenv("REDIS_URL", "x")
-			t.Setenv("AMQP_URL", "x")
+			t.Setenv("KAFKA_BROKERS", "x")
 			t.Setenv(missing, "")
-			_, err := LoadPublisher()
+			_, err := LoadWorker()
 			require.ErrorContains(t, err, missing)
 		})
 	}
