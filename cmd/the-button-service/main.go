@@ -20,6 +20,7 @@ import (
 	"github.com/the-algovn/the-button-service/internal/config"
 	"github.com/the-algovn/the-button-service/internal/countercache"
 	"github.com/the-algovn/the-button-service/internal/difficulty"
+	"github.com/the-algovn/the-button-service/internal/kafka"
 	"github.com/the-algovn/the-button-service/internal/server"
 	"github.com/the-algovn/the-button-service/internal/store"
 )
@@ -51,6 +52,13 @@ func main() {
 	}
 	defer rdb.Close()
 
+	prod, err := kafka.NewProducer(cfg.KafkaBrokers)
+	if err != nil {
+		logger.Error("kafka producer", "err", err)
+		os.Exit(1)
+	}
+	defer prod.Close()
+
 	cache := &countercache.Cache{RDB: rdb, Logger: logger}
 	go cache.Run(ctx)
 
@@ -62,7 +70,7 @@ func main() {
 		keys = append(keys, cfg.PowSecretPrev)
 	}
 	srv := &server.Server{
-		Pool: pool, RDB: rdb, Tick: cache, Diff: diff, Logger: logger,
+		Pool: pool, RDB: rdb, Prod: prod, Tick: cache, Diff: diff, Logger: logger,
 		W0: cfg.PowW0, Keys: keys,
 	}
 

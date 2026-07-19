@@ -1,7 +1,6 @@
-// Package clicks implements the accepted-submit hot path (spec §4): one
-// atomic Redis script does burn -> throttle -> counter increments -> event
-// hand-off. Postgres is not on this path; the publisher's persist worker
-// mirrors Redis to Postgres asynchronously.
+// Package clicks is the pure-ack hot path: verify already happened in the
+// server; here we throttle (Redis) and produce the click event to Kafka. No
+// counter/board mutation — the worker groups own that.
 package clicks
 
 import (
@@ -9,35 +8,36 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/the-algovn/the-button-service/internal/clickevent"
+	"github.com/the-algovn/the-button-service/internal/kafka"
 	"github.com/the-algovn/the-button-service/internal/pow"
 )
 
-// Result is the outcome of an accepted batch.
-type Result struct {
-	UserTotal uint64
-}
-
-// Submit runs the hot-path script for an already-verified challenge payload.
-// Returned errors are gRPC status errors:
-//   - AlreadyExists     — challenge replay (burn key present)
-//   - ResourceExhausted — per-user min-interval hit (token un-burned, stays valid)
-//   - Unavailable       — Redis unreachable (clicks fail closed)
-func Submit(ctx context.Context, rdb redis.Scripter, p pow.Payload, count uint32, now time.Time, displayName string) (*Result, error) {
-	res, err := runHotPath(ctx, rdb, p, count, now, displayName)
+// Submit throttles the sub in Redis and, if allowed, produces the click event
+// to Kafka. Returned errors are gRPC status errors:
+//   - ResourceExhausted — per-user min-interval hit
+//   - Unavailable       — Redis or Kafka produce failure
+func Submit(ctx context.Context, rdb redis.Cmdable, prod *kgo.Client, p pow.Payload, count uint32, now time.Time, displayName string) error {
+	ok, err := rdb.SetNX(ctx, "throttle:"+p.Sub, "1", time.Duration(p.MinIntervalS)*time.Second).Result()
 	if err != nil {
-		return nil, status.Error(codes.Unavailable, "redis unavailable")
+		return status.Error(codes.Unavailable, "redis unavailable")
 	}
-	switch res.Status {
-	case "replay":
-		return nil, status.Error(codes.AlreadyExists, "challenge already redeemed")
-	case "throttled":
-		return nil, status.Error(codes.ResourceExhausted, "min interval not elapsed")
-	case "ok":
-		return &Result{UserTotal: res.UserTotal}, nil
-	default:
-		return nil, status.Error(codes.Internal, "unexpected hot-path status")
+	if !ok {
+		return status.Error(codes.ResourceExhausted, "min interval not elapsed")
 	}
+	ev := clickevent.Click{Sub: p.Sub, Count: count, ChallengeID: p.ID, TsUnix: now.Unix(), DisplayName: displayName}
+	val, err := ev.Marshal()
+	if err != nil {
+		return status.Error(codes.Internal, "marshal click")
+	}
+	if perr := kafka.Produce(ctx, prod, kafka.TopicClicks, ev.Key(), val); perr != nil {
+		// Best-effort un-throttle so the client's retry isn't locked out.
+		_ = rdb.Del(ctx, "throttle:"+p.Sub).Err()
+		return status.Error(codes.Unavailable, "enqueue failed")
+	}
+	return nil
 }

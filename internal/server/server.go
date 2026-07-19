@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -40,6 +41,7 @@ type Server struct {
 	buttonv1.UnimplementedButtonServiceServer
 	Pool   *pgxpool.Pool
 	RDB    *redis.Client
+	Prod   *kgo.Client
 	Tick   Totaler
 	Diff   *difficulty.Cache
 	Logger *slog.Logger
@@ -188,11 +190,10 @@ func (s *Server) SubmitClicks(ctx context.Context, req *buttonv1.SubmitClicksReq
 		return nil, status.Error(codes.InvalidArgument, "bad proof of work")
 	}
 
-	res, err := clicks.Submit(ctx, s.RDB, p, count, now, displayName)
-	if err != nil {
+	if err := clicks.Submit(ctx, s.RDB, s.Prod, p, count, now, displayName); err != nil {
 		return nil, err
 	}
-	resp := &buttonv1.SubmitClicksResponse{UserTotalClicks: res.UserTotal}
+	resp := &buttonv1.SubmitClicksResponse{}
 	// piggyback the next challenge; issuance failure must not void the batch
 	if next, err := s.issue(sub); err == nil {
 		resp.NextChallenge = next
