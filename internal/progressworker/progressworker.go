@@ -111,28 +111,33 @@ func (w *Worker) applyEvent(ctx context.Context, ev clickevent.Click) error {
 	weekKey := leaderboard.WeekKey(now)
 	date := DateHCM(now)
 	weekStart := leaderboard.WeekStartString(now)
-
-	if err := w.RDB.ZIncrBy(ctx, leaderboard.AllTimeKey, float64(ev.Count), ev.Sub).Err(); err != nil {
-		return err
-	}
-	if err := w.RDB.ZIncrBy(ctx, weekKey, float64(ev.Count), ev.Sub).Err(); err != nil {
-		return err
-	}
-	w.RDB.Expire(ctx, weekKey, leaderboard.WeekTTL)
-	w.RDB.HSet(ctx, "profile:names", ev.Sub, ev.DisplayName)
-
 	dk := "daily:" + ev.Sub + ":" + date
-	w.RDB.HIncrBy(ctx, dk, "clicks", int64(ev.Count))
-	w.RDB.HIncrBy(ctx, dk, "batches", 1)
-	if cur, _ := w.RDB.HGet(ctx, dk, "maxbatch").Uint64(); uint64(ev.Count) > cur {
-		w.RDB.HSet(ctx, dk, "maxbatch", ev.Count)
-	}
-	w.RDB.Expire(ctx, dk, dailyTTL)
-
 	wk := "weekdays:" + ev.Sub + ":" + weekStart
-	w.RDB.SAdd(ctx, wk, date)
-	w.RDB.Expire(ctx, wk, leaderboard.WeekTTL)
-	return nil
+
+	// Raise-only maxbatch: read the current value first (idempotency-gated, so no
+	// concurrent duplicate can race this read-then-write).
+	curMax, err := w.RDB.HGet(ctx, dk, "maxbatch").Uint64()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+
+	// All effects in one atomic pipeline: either the whole event's state applies
+	// or the error propagates and the batch is not committed (re-delivered).
+	pipe := w.RDB.TxPipeline()
+	pipe.ZIncrBy(ctx, leaderboard.AllTimeKey, float64(ev.Count), ev.Sub)
+	pipe.ZIncrBy(ctx, weekKey, float64(ev.Count), ev.Sub)
+	pipe.Expire(ctx, weekKey, leaderboard.WeekTTL)
+	pipe.HSet(ctx, "profile:names", ev.Sub, ev.DisplayName)
+	pipe.HIncrBy(ctx, dk, "clicks", int64(ev.Count))
+	pipe.HIncrBy(ctx, dk, "batches", 1)
+	if uint64(ev.Count) > curMax {
+		pipe.HSet(ctx, dk, "maxbatch", ev.Count)
+	}
+	pipe.Expire(ctx, dk, dailyTTL)
+	pipe.SAdd(ctx, wk, date)
+	pipe.Expire(ctx, wk, leaderboard.WeekTTL)
+	_, err = pipe.Exec(ctx)
+	return err
 }
 
 func (w *Worker) leaderboardTick(ctx context.Context) {
