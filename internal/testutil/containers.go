@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/modules/redpanda"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
@@ -43,4 +44,18 @@ func StartRedis(t *testing.T) string {
 	url, err := c.ConnectionString(ctx)
 	require.NoError(t, err)
 	return url
+}
+
+// StartRedpanda runs a single-node Redpanda broker and returns its Kafka seed
+// broker address. Redpanda speaks the Kafka protocol, so franz-go connects to
+// it unchanged.
+func StartRedpanda(t *testing.T) []string {
+	t.Helper()
+	ctx := context.Background()
+	c, err := redpanda.Run(ctx, "redpandadata/redpanda:v24.2.7")
+	testcontainers.CleanupContainer(t, c)
+	require.NoError(t, err)
+	seed, err := c.KafkaSeedBroker(ctx)
+	require.NoError(t, err)
+	return []string{seed}
 }
