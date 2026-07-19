@@ -32,6 +32,14 @@ var Catalog = []Achievement{
 	{"maxbatch", "One Batch to Rule Them All", "A perfect 10,000-click batch. The machines are impressed."},
 	{"night", "3am Rebellion", "Clicking at 3am. The button appreciates your insomnia."},
 	{"lunch", "Lunch Break Rebel", "Clicked between noon and one. The sandwich can wait."},
+	{"deep_thought", "Deep Thought", "Your total crossed 42 — the answer to life, the universe, and this button."},
+	{"irrational", "Irrational", "Your total crossed 314. You've come full circle. Well, π of one."},
+	{"cursed", "Number of the Beast", "Your total crossed 666. The button grows... concerned."},
+	{"elite", "l33t", "Your total crossed 1,337. You are elite now. Hackerman."},
+	{"over9000", "It's Over 9000", "Your total crossed 9,000. WHAT? NINE THOUSAND?!"},
+	{"chonk", "Chonky Batch", "2,000 clicks in a single batch. Absolute unit."},
+	{"witching", "Witching Hour", "A batch at midnight in Ho Chi Minh City. The button is nocturnal too."},
+	{"dawn", "Crack of Dawn", "A batch at 5am, HCMC time. Sleep is a construct."},
 }
 
 // Milestones are the global thresholds announced by the publisher
@@ -73,8 +81,9 @@ var thresholds = []struct {
 	x  uint64
 	id string
 }{
-	{1, "mvh"}, {10, "ten"}, {69, "nice"}, {100, "century"},
-	{420, "blaze"}, {1_000, "comma"}, {10_000, "carpal"}, {100_000, "stretch"},
+	{1, "mvh"}, {10, "ten"}, {42, "deep_thought"}, {69, "nice"}, {100, "century"},
+	{314, "irrational"}, {420, "blaze"}, {666, "cursed"}, {1_000, "comma"},
+	{1_337, "elite"}, {9_001, "over9000"}, {10_000, "carpal"}, {100_000, "stretch"},
 }
 
 // crosses reports old_total < x ≤ new_total with old_total = total - batch
@@ -105,12 +114,19 @@ func Evaluate(total uint64, batch uint32, now time.Time) []Achievement {
 	if batch >= 500 {
 		add("bigbatch")
 	}
+	if batch >= 2_000 {
+		add("chonk")
+	}
 	if batch == 10_000 {
 		add("maxbatch")
 	}
 	switch now.In(hcm).Hour() {
+	case 0:
+		add("witching")
 	case 3:
 		add("night")
+	case 5:
+		add("dawn")
 	case 12:
 		add("lunch")
 	}
